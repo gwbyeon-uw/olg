@@ -1,0 +1,15 @@
+{   
+    "rf_Nov05_2021":     {"name":         "RoseTTAFold 3-track, Nov. 5 2021",
+                          "code_path":    "models.rf_Nov05_2021.RoseTTAFoldModel.RoseTTAFoldModule", 
+                          "weights_path": "rf_Nov05",
+                          "params_path":  "params_Nov05.json",
+                          "checkpoints":  ["BFF_last.pt"],
+                          "visible":      1},
+
+    "rf_Jul31_2022":     {"name":         "full_bigSE3_model1, Jul. 31 2022. Deep architecture w/ big SE(3)-Transformer on fully connected graph. Trained on biounit",
+                          "code_path":    "models.rf_Jul31_2022.RoseTTAFoldModel.RoseTTAFoldModule", 
+                          "weights_path": "rf_Jul31",
+                          "params_path":  "params_Jul31.json",
+                          "checkpoints":  ["full_bigSE3_model1.pt"],
+                          "visible":      1}
+    }
