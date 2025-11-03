@@ -1,56 +1,38 @@
 from tqdm import tqdm
 
-import numpy as np
+from typing import Tuple, List, Union, Literal, Optional
+
 import torch
+import numpy as np
+import numpy.typing as npt
 
 from constants import *
-from utils import *
+from config import ProteinConfig
 
-#For EvoDiff
-from scipy.spatial.distance import hamming, cdist
-from sequence_models.constants import PROTEIN_ALPHABET, GAP
 from evodiff.utils import Tokenizer
 from evodiff.pretrained import MSA_OA_DM_MAXSUB, ESM_MSA_1b #https://github.com/microsoft/evodiff/tree/main#loading-pretrained-models
 
-def load_evodiff_model(device):
-    checkpoint = MSA_OA_DM_MAXSUB()
-    model, _, tokenizer, _ = checkpoint
-    model = model.to(device)
-    model.eval()
-    model.requires_grad_(False)
-    return model, tokenizer
+from .base_wrapper import BaseWrapper
 
-def load_esmmsa_model(device):
-    checkpoint = ESM_MSA_1b()
-    model, _, alphabet, _ = checkpoint
-    model = model.to(device)
-    model = model.eval()
-    model.requires_grad_(False)
-    evodiff_tokenizer = Tokenizer()
-    return model, alphabet, evodiff_tokenizer
-
-#Helper class to handle generate a protein sequence with EvoDiff
-class EvoDiffContainer():
-    def __init__(self, device, model, tokenizer, 
-                 msa_seqs, msa_n_seq, msa_max_length, msa_selection_type, 
-                 seq_len, seq_start, fixed_positions, gap_positions, prefixed_seq, 
-                 decoding_order, end_stop, repetition_penalty, repetition_penalty_window,
-                 logit_weight, logit_bias, aa_bias, 
-                 max_aa_count, max_pos_count, 
-                 truncate_topp, rand_base, tqdm_disable, use_esm_msa):
-
-        self.tqdm_disable = tqdm_disable
-        self.device = device
-        self.use_esm_msa = use_esm_msa #Flag to use MSA Transformer instead of EvoDiff-MSA
-        if (model is None) or (tokenizer is None):
-            if not self.use_esm_msa:
-                self.model, self.tokenizer = load_evodiff_model(self.device)
-            else:
-                self.model, _, self.tokenizer = load_esmmsa_model(self.device)
-        else:
-            self.model = model
-            self.tokenizer = tokenizer
+class WrapperEvoDiff(BaseWrapper):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        tokenizer: Tokenizer,
+        msa_seqs: List[str],
+        msa_n_seq: int,
+        msa_max_length: int,
+        msa_selection_type: Literal['random', 'MaxHamming', 'MaxHammingI'] = 'random',
+        use_esm_msa: bool = False,        
+        prefixed_seq: Optional[Tuple[int, int, str]] = None,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
         
+        self.use_esm_msa = use_esm_msa #Flag to use MSA Transformer instead of EvoDiff-MSA
+        self.model = model
+        self.tokenizer = tokenizer
+    
         #MSA subsampling        
         self.msa_seqs = msa_seqs
         self.msa_n_seq = msa_n_seq # number of sequences in MSA to subsample
@@ -58,88 +40,183 @@ class EvoDiffContainer():
         self.seq_len = self.msa_max_length #Set to same as MSA length for now
         self.msa_selection_type = msa_selection_type # or 'MaxHamming'; MSA subsampling scheme
 
-        self.valid_msa_, self.query_sequence, _ = subsample_msa(self.msa_seqs, 
-                                                               n_sequences=self.msa_n_seq,
-                                                               max_seq_len=self.msa_max_length,
-                                                               selection_type=self.msa_selection_type)
+        self.valid_msa_, self.query_sequence, _ = self.subsample_msa(
+            self.msa_seqs, 
+            n_sequences=self.msa_n_seq,
+            max_seq_len=self.msa_max_length,
+            selection_type=self.msa_selection_type
+        )
         self.valid_msa = torch.tensor(np.array([self.tokenizer.tokenizeMSA(seq) for seq in self.valid_msa_]), device=self.device) #Tokenize sequence
         self.padding = torch.full((self.msa_n_seq, self.msa_max_length-self.seq_len), fill_value=self.tokenizer.pad_id, device=self.device)
         
-        self.alphabet_map = torch.tensor([ self.tokenizer.a_to_i[l] for l in ALPHABET_GAP ], device=self.device) #Index we use to EvoDiff index
-        self.alphabet_map_rev = torch.tensor([ ALPHABET_GAP.index(a) if a in ALPHABET_GAP else -1 for a in self.tokenizer.alphabet  ], device=self.device) #EvoDiff index to index we use
-        #self.alphabet_inds = self.alphabet_map_rev[self.alphabet_map_rev!=-1]
-        self.alphabet_inds = torch.arange(20, device=self.device) #Dummy
+        self.alphabet_map = torch.tensor([ self.tokenizer.a_to_i[l] for l in Constants.ALPHABET_GAP ], device=self.device) #Index we use to EvoDiff index
+        self.alphabet_map_rev = torch.tensor([ Constants.ALPHABET_GAP.index(a) if a in Constants.ALPHABET_GAP else -1 for a in self.tokenizer.alphabet  ], device=self.device) #EvoDiff index to index we use
 
-        self.remap_to_evodiff = REMAP_TO_EVODIFF.to(self.device)
-        self.remap_to_esmmsa = REMAP_TO_ESM_MSA.to(self.device)
-        
-        self.seq_start = seq_start #Offset to start from
         self.prefixed_seq = prefixed_seq #List of tuples, (start, end, seq)
-        self.end_stop = end_stop
+        
+        self.remap_to_evodiff = Constants.REMAP_TO_EVODIFF.to(self.device)
+        self.remap_to_esmmsa = Constants.REMAP_TO_ESM_MSA.to(self.device)
 
         self.gap_positions =  None
         self.gap_map = torch.arange(self.seq_len, device=self.device) #From our protein position to MSA position with gaps
         self.gap_map_rev = self.gap_map.clone()
-        if gap_positions is not None:
-            self.gap_positions = torch.tensor(gap_positions, device=self.device).sort()[0] - 1 #to 0-based
+        if self.config.gap_positions is not None:
+            self.gap_positions = torch.tensor(self.config.gap_positions, device=self.device).sort()[0] - 1 #to 0-based
             self.gap_map[self.gap_positions] = -1
             self.gap_map = self.gap_map[self.gap_map!=-1] 
             self.gap_map_rev[self.gap_positions] = -1
             self.gap_map_rev[self.gap_map_rev!=-1] = torch.arange(self.gap_map.shape[0], device=self.device)
             
-        self.repetition_penalty = repetition_penalty
-        self.repetition_penalty_window = repetition_penalty_window
-        
-        if logit_weight is None:
-            self.logit_weight = torch.ones(self.seq_len, device=self.device)
-        else:
-            self.logit_weight = logit_weight
-        
-        if logit_bias is None:
-            self.logit_bias = torch.zeros((self.seq_len, len(ALPHABET)), device=self.device)
-        else:
-            self.logit_bias = logit_bias
-            
-        #Biases; these get added to logits
-        if aa_bias is None:
-            self.aa_bias = torch.zeros(len(ALPHABET), device=self.device)
-        else:
-            self.aa_bias = aa_bias
-             
-        if max_aa_count is None:
-            self.max_aa_count = torch.zeros(len(ALPHABET), device=self.device) + MAX_LOGIT
-        else:
-            self.max_aa_count = max_aa_count
-            
-        if max_pos_count is None:
-            self.max_pos_count = MAX_LOGIT
-        else:
-            self.max_pos_count = max_pos_count
-            
-        if truncate_topp is None:
-            self.truncate_topp = 0.0
-        else:
-            self.truncate_topp = truncate_topp
-            
         tmp = torch.zeros(self.seq_len, device=self.device) - 1 #Position relative to target protein
-        if fixed_positions is not None:
-            for pos, aa in fixed_positions:
-                tmp[pos-1] = ALPHABET.index(aa)
+        if self.config.fixed_positions is not None:
+            for pos, aa in self.config.fixed_positions:
+                tmp[pos-1] = Constants.ALPHABET.index(aa)
         self.fixed_positions = tmp.long() #This will have -1 non-fixed positions and AA index at fixed positions    
         
-        self.reset(decoding_order, rand_base)    
+        self.reset(self.decoding_order, self.rand_base)
 
-    def reset_decoding_order(self, decoding_order):
+    @staticmethod
+    def _load_evodiff_model(device):
+        checkpoint = MSA_OA_DM_MAXSUB()
+        model, _, tokenizer, _ = checkpoint
+        model = model.to(device)
+        model.eval()
+        model.requires_grad_(False)
+        return model, tokenizer
+
+    @staticmethod
+    def _load_esmmsa_model(device):
+        checkpoint = ESM_MSA_1b()
+        model, _, alphabet, _ = checkpoint
+        model = model.to(device)
+        model = model.eval()
+        model.requires_grad_(False)
+        evodiff_tokenizer = Tokenizer()
+        return model, alphabet, evodiff_tokenizer
+
+    @staticmethod
+    def tokenizeMSA(
+        seq: Union[str, List[str]]
+    ) -> npt.NDArray[np.int_]:
+        return np.array([Constants.EVODIFF_ALPHABET_INDEX[a] for a in seq])
+    
+    @staticmethod
+    def subsample_msa(
+        parsed_msa: List[str], 
+        n_sequences: int = 64, 
+        max_seq_len: int = 512, 
+        selection_type: Literal['random', 'MaxHamming', 'MaxHammingI'] = 'random'
+    ) -> Tuple[List[str], str, List[str]]:
+        """
+        Modified from https://github.com/microsoft/evodiff/blob/main/evodiff/data.py
+        Subsample an MSA (Multiple Sequence Alignment) based on different selection strategies.
+        
+        Args:
+            parsed_msa: List of sequences in the MSA, where aligned positions are uppercase
+                or '-', and unaligned positions are lowercase or '.'.
+            n_sequences: Number of sequences to subsample. Must be <= number of sequences in MSA.
+            max_seq_len: Maximum sequence length to consider. If MSA is longer, a random slice
+                of this length is used.
+            selection_type: Strategy for selecting sequences:
+                - 'random': Randomly select sequences
+                - 'MaxHamming': Maximize Hamming distance between selected sequences,
+                  starting with a random seed
+                - 'MaxHammingI': Like MaxHamming but starts with the first sequence as seed
+        
+        Returns:
+            Tuple containing:
+                - output: List of aligned sequences as strings
+                - anchor_seq: The first (query) sequence from the output
+                - unal: List of the original unaligned sequences corresponding to selected sequences
+        """    
+        alphabet = Constants.EVODIFF_ALPHABET #EvoDiff alphabet
+        alpha = np.array(list(alphabet))
+        gap_idx = Constants.EVODIFF_ALPHABET_INDEX['-']
+        pad_idx = Constants.EVODIFF_ALPHABET_INDEX['!']
+        
+        #Do hamming distance from aligned section
+        aligned_msa = [ [ char for char in seq if (char.isupper() or char == '-') and not char == '.' ] for seq in parsed_msa ]   
+    
+        tokenized_msa = [ WrapperEvoDiff.tokenizeMSA(seq) for seq in aligned_msa ]
+        tokenized_msa = np.array([l.tolist() for l in tokenized_msa])
+        msa_seq_len = len(tokenized_msa[0])
+    
+        if msa_seq_len > max_seq_len:
+            slice_start = np.random.choice(msa_seq_len - max_seq_len + 1)
+            seq_len = max_seq_len
+        else:
+            slice_start = 0
+            seq_len = msa_seq_len
+    
+        sliced_msa_seq = tokenized_msa[:, slice_start: slice_start + max_seq_len]
+        anchor_seq = sliced_msa_seq[0]  # This is the query sequence in MSA
+    
+        # slice out all-gap rows
+        sliced_msa = [seq for seq in sliced_msa_seq if (list(set(seq)) != [gap_idx])]
+        msa_num_seqs = len(sliced_msa)
+    
+        if msa_num_seqs < n_sequences:
+            output = np.full(shape=(n_sequences, seq_len), fill_value=pad_idx)
+            output[:msa_num_seqs] = sliced_msa
+            unal = parsed_msa
+            raise Exception("msa num_seqs < self.n_sequences, indicates dataset not filtered properly")
+        elif msa_num_seqs > n_sequences:
+            if selection_type == 'random':
+                random_idx = np.random.choice(msa_num_seqs - 1, size=n_sequences - 1, replace=False) + 1
+                anchor_seq = np.expand_dims(anchor_seq, axis=0)
+                output = np.concatenate((anchor_seq, np.array(sliced_msa)[random_idx.astype(int)]), axis=0)
+                unal = [ parsed_msa[i] for i in random_idx ]
+            elif selection_type == "MaxHamming" or selection_type == "MaxHammingI":
+                unal_inds = [0]
+                output = [list(anchor_seq)]
+                msa_subset = sliced_msa[1:]
+                msa_ind = np.arange(msa_num_seqs)[1:]
+                
+                if selection_type == "MaxHammingI":
+                    random_ind = 0
+                else:
+                    random_ind = np.random.choice(msa_ind)
+                    
+                random_seq = sliced_msa[random_ind]
+                output.append(list(random_seq))
+                unal_inds.append(random_ind)
+                random_seq = np.expand_dims(random_seq, axis=0)
+                msa_subset = np.delete(msa_subset, (random_ind - 1), axis=0)
+                m = len(msa_ind) - 1
+                distance_matrix = np.ones((n_sequences - 2, m))
+                msa_ind = np.delete(msa_ind, msa_ind[msa_ind==(random_ind-1)]-1)
+    
+                for i in range(n_sequences - 2):
+                    curr_dist = cdist(random_seq, msa_subset, metric='hamming')
+                    curr_dist = np.expand_dims(np.array(curr_dist), axis=0)  # shape is now (1,msa_num_seqs)
+                    distance_matrix[i] = curr_dist
+                    col_min = np.min(distance_matrix, axis=0)  # (1,num_choices)
+                    max_ind = np.argmax(col_min)
+                    random_ind = max_ind
+                    random_seq = msa_subset[random_ind]
+                    output.append(list(random_seq))
+                    unal_inds.append(msa_ind[random_ind])
+                    random_seq = np.expand_dims(random_seq, axis=0)
+                    msa_subset = np.delete(msa_subset, random_ind, axis=0)
+                    msa_ind = np.delete(msa_ind, random_ind)
+                    distance_matrix = np.delete(distance_matrix, random_ind, axis=1)
+                    
+                unal = [ parsed_msa[i] for i in unal_inds ]
+        else:
+            unal = parsed_msa
+            output = sliced_msa
+    
+        output = [''.join(seq) for seq in alpha[output]]
+        return output, output[0], unal
+    
+    def _reset_decoding_order(self, decoding_order):
         self.decoding_order = decoding_order
         self.end_pos = torch.max(self.decoding_order)
-        
+    
     #Resets decoding; sequences are emptied and various trackers are set to zero
     def reset(self, decoding_order, rand_base, seed_S=None):
-        self.reset_decoding_order(decoding_order)
         self.rand_base = rand_base
-        
-        if self.rand_base is not None:
-            np.random.seed(self.rand_base) #Random seed
+        self._reset_decoding_order(decoding_order)
         
         self.S_orig = self.valid_msa[0, :self.seq_len]
         self.S_msa = torch.full((1, self.msa_n_seq, self.msa_max_length), fill_value=self.tokenizer.mask_id, device=self.device)
@@ -165,7 +242,7 @@ class EvoDiffContainer():
             if self.gap_positions is not None:
                 for p in self.gap_positions:
                     self.decode_next(use_t_msa=p)
-                    self.update_S(S_t=GAP_TOKEN, use_t_msa=p, alphabet_map=False)
+                    self.update_S(S_t=Constants.GAP_TOKEN, use_t_msa=p, alphabet_map=False)
                     
             if self.prefixed_seq is not None:
                 for fixed_start, fixed_end, fixed_seq in self.prefixed_seq:
@@ -184,7 +261,7 @@ class EvoDiffContainer():
             t_msa = use_t_msa
             t = self.gap_map_rev[t_msa]
 
-        if not (self.end_stop and (t == self.end_pos)):
+        if not (self.config.force_stop and (t == self.end_pos)):
             if dummy_run:
                 self.current_pred = torch.zeros((self.S_msa.shape[2], len(self.tokenizer.alphabet)), device=self.device)
             else:
@@ -201,66 +278,52 @@ class EvoDiffContainer():
                     self.current_pred = self.model(self.S_msa)[0, 0, :, :]  #Output shape of preds is (BS=1, N=64, L, n_tokens=31)
 
         if t > -1:
-            if (use_t_msa is None) and self.end_stop and (t == self.end_pos): #Everything is zero except stop index
-                logits = torch.zeros(self.aa_bias.shape, device=self.device).unsqueeze(0)
-                logits[0, STOP_INDEX] = MAX_LOGIT #High number to force stop
-                logits = add_noise(logits)
+            if (use_t_msa is None) and self.config.force_stop and (t == self.end_pos): #Everything is zero except stop index
+                logits = self._force_stop()
                 return logits, logits
                 
             self.current_logits = self.current_pred[t_msa, :].unsqueeze(0) #Logits at current position, unless it's a stop and > length of protein
     
             if dummy_run:
                 logits_ = self.current_logits.clone()[:, self.alphabet_map] #Only the alphabet we use
-                logits_[:, STOP_INDEX] = MIN_LOGIT #Zero out the index for X
+                logits_[:, Constants.STOP_INDEX] = Constants.MIN_LOGIT #Zero out the index for X
                 logits = logits_.clone() 
             else:
                 logits_ = self.current_logits.clone() #Only first row and standard AAs
                 logits_ -= logits_.mean() #Center it
                 logits_ = logits_[:, self.alphabet_map] #Only the alphabet we use
-                logits_[:, STOP_INDEX] = MIN_LOGIT #Zero out the index for X
+                logits_[:, Constants.STOP_INDEX] = Constants.MIN_LOGIT #Zero out the index for X
 
                 logits = logits_.clone()
                 
                 #Repeat penalty
-                t_left = max(0, t-self.repetition_penalty_window)
-                t_right = min(self.decoded_positions.shape[1], t+self.repetition_penalty_window)
-                if (t_right + 1 - t_left) > 0:
-                    decoded_pos = self.decoded_positions[0, t_left:(t_right+1)].bool()
-                    if decoded_pos.sum() > 0:
-                        neighbor_aa = self.alphabet_map_rev[self.S[0, t_left:(t_right+1)][decoded_pos]]
-                        uniq_ct = torch.unique(neighbor_aa, return_counts=True)
-                        if neighbor_aa.shape[0] > 0:
-                            logits_p = logits[0, uniq_ct[0]]
-                            rep_pen = self.repetition_penalty**uniq_ct[1]
-                            logits_p = torch.where(logits_p < 0, logits_p * rep_pen, logits_p / rep_pen)
-                            logits.scatter_(1, uniq_ct[0].unsqueeze(0), logits_p.unsqueeze(0))
+                logits = self._apply_repetition_penalty(logits, t)
                 
                 #Final logits x some weight/temperature
-                logits = self.logit_weight[t] * (logits + self.aa_bias.unsqueeze(0) + self.logit_bias[t:(t+1), :])
+                logits = self._apply_weights_and_biases(logits, t)
                 
                 #These suppress some AA's on hard thresholding of their counts
                 aa_count = torch.nn.functional.one_hot(self.S[:,self.decoded_positions[0].bool()], num_classes=len(self.tokenizer.alphabet)).sum(1)[:, self.
                 alphabet_map]
-                max_aa = (aa_count >= self.max_aa_count)
-                logits[max_aa] = MIN_LOGIT
+                max_aa = (aa_count >= self.config.max_aa_count)
+                logits[max_aa] = Constants.MIN_LOGIT
     
                 #Positive AA total counts
-                if (aa_count[0, 6] + aa_count[0, 8] + aa_count[0, 14]) >= self.max_pos_count: #This is for positively charged AA's; H/K/R
-                    logits[0, 6] = MIN_LOGIT
-                    logits[0, 8] = MIN_LOGIT
-                    logits[0, 14] = MIN_LOGIT
+                if (aa_count[0, 6] + aa_count[0, 8] + aa_count[0, 14]) >= self.config.max_pos_count: #This is for positively charged AA's; H/K/R
+                    logits[0, 6] = Constants.MIN_LOGIT
+                    logits[0, 8] = Constants.MIN_LOGIT
+                    logits[0, 14] = Constants.MIN_LOGIT
     
-                logits = top_p(logits, self.truncate_topp) #Top-p filtering
+                logits = BaseWrapper._top_p(logits, self.config.truncate_topp) #Top-p filtering
 
-            if (use_t_msa is None) and ((not self.end_stop) or (t != self.end_pos)): #Penalize stop codon if not at last position
-                logits_[0, STOP_INDEX] = MIN_LOGIT
-                logits[0, STOP_INDEX] = MIN_LOGIT
+            if (use_t_msa is None) and ((not self.config.force_stop) or (t != self.end_pos)): #Penalize stop codon if not at last position
+                logits_ = self._penalize_stop(logits_)
+                logits = self._penalize_stop(logits)
             
             if (use_t_msa is None) and self.fixed_positions[t] != -1: #Everything is zero except fixed position
-                logits = torch.zeros(self.aa_bias.shape, device=self.device).unsqueeze(0)
-                logits[0, self.fixed_positions[t]] = MAX_LOGIT #High number to force fixed residue
+                logits = self._force_fixed_positions(logits, t)
     
-            logits = add_noise(logits)
+            logits = BaseWrapper._add_noise(logits)
             return logits, logits_
     
     def edit_S(self, t, S_t, inplace=False): #t here is relative to MSA; S is EvoDiff alphabet
@@ -282,7 +345,7 @@ class EvoDiffContainer():
     def update_S(self, S_t, use_t_msa=None, alphabet_map=True, use_t=None, dummy_run=False): #t here is relative to protein (no gap); S_t is EvoDiff alphabet
         if use_t_msa is None:
             t = self.decoding_order[:, self.next_t]
-            if self.end_stop and (t == self.end_pos):
+            if self.config.force_stop and (t == self.end_pos):
                 self.next_t += 1
                 return False
             t_msa = self.gap_map[t] #Decoding position, relative to the MSA of the target protein
@@ -308,7 +371,7 @@ class EvoDiffContainer():
     def preset_fixed_S(self, fixed_start, fixed_end, fixed_seq):
         t = torch.range(fixed_start, fixed_end, device=self.device)
         t_msa = self.gap_map[t] #Decoding position, relative to the MSA of the target protein
-        fixed_token = self.alphabet_map[torch.tensor([ ALPHABET_GAP.index(c) for c in fixed_seq ], device=self.device)]
+        fixed_token = self.alphabet_map[torch.tensor([ Constants.ALPHABET_GAP.index(c) for c in fixed_seq ], device=self.device)]
         self.edit_S(t_msa, fixed_token, inplace=True) #t here not relative to MSA
         self.decoded_positions[:, t_msa] = 1.0
     
@@ -324,8 +387,8 @@ class EvoDiffContainer():
             
     def get_prot_seq(self, S=None):
         if S is None:
-            S = self.alphabet_map_rev[self.S[0, self.seq_start:self.seq_len]]
-        prot = ''.join([ALPHABET_GAP[s] for s in S])
+            S = self.alphabet_map_rev[self.S[0, self.config.start_offset:self.seq_len]]
+        prot = ''.join([Constants.ALPHABET_GAP[s] for s in S])
         return prot
 
     #Decodes all; this is used to design non-overlapping proteins with the same parameters
@@ -342,7 +405,7 @@ class EvoDiffContainer():
             for i in tqdm(range(self.decoding_order.shape[1]), disable=self.tqdm_disable): 
                 self.decode_next(mask_current=mask_current)
                 t = self.decoding_order[:, i]
-                if not (self.end_stop and (t == self.end_pos)):
+                if not (self.config.force_stop and (t == self.end_pos)):
                     S_t = use_S[self.gap_map[t]]
                 else:
                     S_t = None

@@ -33,7 +33,7 @@ pip install torch numpy biopython tqdm
 
 ```bash
 git clone <repository-url>
-cd olgdesign
+cd olg
 ```
 
 Download pre-trained model weights and place them in appropriate directories
@@ -279,16 +279,16 @@ best_ind = torch.stack([ torch.stack(s) for s in scores_pll ]).max(1)[0].argmin(
 ```
 ├── olgdesign.py              # Main OLGDesign class
 ├── constants.py              
-├── utils.py                  
+├── config.py    
+├── compatibility.py                  
+├── coordinates.py
 ├── genetic_code_randomizer.py # For alternative genetic code generation
-├── gremlin.py               # Barebone GREMLIN model in torch
 ├── wrappers/                # Model wrapper classes
 │   ├── proteinmpnn.py
 │   ├── evodiff.py
 │   ├── gremlin.py
 │   ├── esm3.py
-│   ├── coflow.py
-│   └── protmamba.py
+│   └── coflow.py
 └── README.md
 ```
 
