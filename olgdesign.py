@@ -600,11 +600,11 @@ class OLGDesign():
         diff = torch.abs(sd0)
         weight = min(self.config.balancer_max_weight, diff * self.config.current_balancer_weight + 1.0)
         if scores_pll[-1][1] > scores_pll[-1][0]:
-            w1 = self.decoders[0].logit_weight
-            w2 = self.decoders[1].logit_weight * weight
+            w1 = torch.ones(self.decoders[0].logit_weight.shape, device=self.decoders[0].logit_weight.device)
+            w2 = torch.ones(self.decoders[1].logit_weight.shape, device=self.decoders[1].logit_weight.device) * weight
         else:
-            w1 = self.decoders[0].logit_weight * weight
-            w2 = self.decoders[1].logit_weight
+            w1 = torch.ones(self.decoders[0].logit_weight.shape, device=self.decoders[0].logit_weight.device) * weight
+            w2 = torch.ones(self.decoders[1].logit_weight.shape, device=self.decoders[1].logit_weight.device)
         return w1, w2
         
     def decode_all_gibbs(
