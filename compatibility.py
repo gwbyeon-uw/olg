@@ -9,6 +9,28 @@ from Bio.Data.CodonTable import unambiguous_dna_by_name
 from constants import *
 from config import DesignConfig
 
+class HashableDict(dict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._hash = None
+    
+    def _make_hashable(self, obj):
+        if isinstance(obj, dict):
+            return tuple(sorted((k, self._make_hashable(v)) for k, v in obj.items()))
+        elif isinstance(obj, (list, tuple)):
+            return tuple(self._make_hashable(item) for item in obj)
+        elif isinstance(obj, set):
+            return frozenset(self._make_hashable(item) for item in obj)
+        return obj
+    
+    def __hash__(self):
+        if self._hash is None:
+            self._hash = hash(self._make_hashable(dict(self)))
+        return self._hash
+    
+    def __setitem__(self, key, value):
+        raise TypeError("HashableDict is immutable")
+        
 class CodonCompatibility:
     """Manages codon compatibility matrices and quartet operations"""
     def __init__(
@@ -23,7 +45,7 @@ class CodonCompatibility:
             self.codon_table = unambiguous_dna_by_name[self.codon_table].forward_table #From Biopython NCBI codes 
             for stop_codon in unambiguous_dna_by_name["Standard"].stop_codons:
                 self.codon_table[stop_codon] = "X"
-        self.codon_table_rev = Constants._reverse_codon_table(self.codon_table)
+        self.codon_table_rev = HashableDict(Constants._reverse_codon_table(self.codon_table))
         self.codon_compatibility, self.quartets_aa = self.generate_compatibility_matrix(self.config.device, self.codon_table)
         
         #First/last nucleotide for each of the 256 quartets
@@ -150,7 +172,7 @@ class CodonCompatibility:
         arrangement: int,
         aa1s: Tuple[Optional[str]],
         aa2s: Tuple[Optional[str]],
-        codon_table_rev: Dict[str, List[str]]
+        codon_table_rev: HashableDict[str, List[str]]
     ) -> np.ndarray:
         """
         Find compatible quartet indices based on amino acid constraints across different reading frames.
@@ -183,7 +205,7 @@ class CodonCompatibility:
         aa2_p, aa2_c, aa2_n = aa2s
         
         # Use sets for faster intersection operations
-        common_indices = set(range(len(QUARTETS)))
+        common_indices = set(range(len(Constants.QUARTETS)))
         
         # Helper function to update common indices with new constraints
         def update_common_indices(aa, lookup_func):
@@ -204,38 +226,38 @@ class CodonCompatibility:
         # These functions encapsulate the logic for each arrangement
         arrangement_handlers = {
             0: lambda: (
-                update_common_indices(aa1_c, lambda codons: {x for c in codons for x in CODONS_TO_QUARTETS[CODON_INDEX[c]][0]}),
-                update_common_indices(aa1_n, lambda codons: {x for c in codons for x in N_QUARTETS[NUCLEOTIDE_INDEX[c[0]]]}),
-                update_common_indices(aa2_p, lambda codons: {x for c in codons for x in P_QUARTETS[NUCLEOTIDE_INDEX[c[-1]]]}),
-                update_common_indices(aa2_c, lambda codons: {x for c in codons for x in CODONS_TO_QUARTETS[CODON_INDEX[c]][1]})
+                update_common_indices(aa1_c, lambda codons: {x for c in codons for x in Constants.CODONS_TO_QUARTETS[Constants.CODON_INDEX[c]][0]}),
+                update_common_indices(aa1_n, lambda codons: {x for c in codons for x in Constants.N_QUARTETS[Constants.NUCLEOTIDE_INDEX[c[0]]]}),
+                update_common_indices(aa2_p, lambda codons: {x for c in codons for x in Constants.P_QUARTETS[Constants.NUCLEOTIDE_INDEX[c[-1]]]}),
+                update_common_indices(aa2_c, lambda codons: {x for c in codons for x in Constants.CODONS_TO_QUARTETS[Constants.CODON_INDEX[c]][1]})
             ),
             
             1: lambda: (
-                update_common_indices(aa1_c, lambda codons: {x for c in codons for x in CODONS_TO_QUARTETS[CODON_INDEX[c]][0]}),
-                update_common_indices(aa1_n, lambda codons: {x for c in codons for x in N_QUARTETS[NUCLEOTIDE_INDEX[c[0]]]}),
-                update_common_indices(aa2_c, lambda codons: {x for c in codons for x in CODONS_TO_QUARTETS[CODON_INDEX[c]][2]}),
-                update_common_indices(aa2_n, lambda codons: {x for c in codons for x in P_QUARTETS[NUCLEOTIDE_INDEX[reverse_complement(c[0])]]})
+                update_common_indices(aa1_c, lambda codons: {x for c in codons for x in Constants.CODONS_TO_QUARTETS[Constants.CODON_INDEX[c]][0]}),
+                update_common_indices(aa1_n, lambda codons: {x for c in codons for x in Constants.N_QUARTETS[Constants.NUCLEOTIDE_INDEX[c[0]]]}),
+                update_common_indices(aa2_c, lambda codons: {x for c in codons for x in Constants.CODONS_TO_QUARTETS[Constants.CODON_INDEX[c]][2]}),
+                update_common_indices(aa2_n, lambda codons: {x for c in codons for x in Constants.P_QUARTETS[Constants.NUCLEOTIDE_INDEX[Constants._reverse_complement(c[0])]]})
             ),
             
             2: lambda: (
-                update_common_indices(aa1_c, lambda codons: {x for c in codons for x in CODONS_TO_QUARTETS[CODON_INDEX[c]][0]}),
-                update_common_indices(aa1_n, lambda codons: {x for c in codons for x in N_QUARTETS[NUCLEOTIDE_INDEX[c[0]]]}),
-                update_common_indices(aa2_p, lambda codons: {x for c in codons for x in N_QUARTETS[NUCLEOTIDE_INDEX[reverse_complement(c[-1])]]}),
-                update_common_indices(aa2_c, lambda codons: {x for c in codons for x in CODONS_TO_QUARTETS[CODON_INDEX[c]][3]})
+                update_common_indices(aa1_c, lambda codons: {x for c in codons for x in Constants.CODONS_TO_QUARTETS[Constants.CODON_INDEX[c]][0]}),
+                update_common_indices(aa1_n, lambda codons: {x for c in codons for x in Constants.N_QUARTETS[Constants.NUCLEOTIDE_INDEX[c[0]]]}),
+                update_common_indices(aa2_p, lambda codons: {x for c in codons for x in Constants.N_QUARTETS[Constants.NUCLEOTIDE_INDEX[Constants._reverse_complement(c[-1])]]}),
+                update_common_indices(aa2_c, lambda codons: {x for c in codons for x in Constants.CODONS_TO_QUARTETS[Constants.CODON_INDEX[c]][3]})
             ),
             
             3: lambda: (
-                update_common_indices(aa1_p, lambda codons: {x for c in codons for x in P_QUARTETS[NUCLEOTIDE_INDEX[c[-1]]]}),
-                update_common_indices(aa1_c, lambda codons: {x for c in codons for x in CODONS_TO_QUARTETS[CODON_INDEX[c]][1]}),
-                update_common_indices(aa2_c, lambda codons: {x for c in codons for x in CODONS_TO_QUARTETS[CODON_INDEX[c]][0]}),
-                update_common_indices(aa2_n, lambda codons: {x for c in codons for x in N_QUARTETS[NUCLEOTIDE_INDEX[c[0]]]})
+                update_common_indices(aa1_p, lambda codons: {x for c in codons for x in Constants.P_QUARTETS[Constants.NUCLEOTIDE_INDEX[c[-1]]]}),
+                update_common_indices(aa1_c, lambda codons: {x for c in codons for x in Constants.CODONS_TO_QUARTETS[Constants.CODON_INDEX[c]][1]}),
+                update_common_indices(aa2_c, lambda codons: {x for c in codons for x in Constants.CODONS_TO_QUARTETS[Constants.CODON_INDEX[c]][0]}),
+                update_common_indices(aa2_n, lambda codons: {x for c in codons for x in Constants.N_QUARTETS[Constants.NUCLEOTIDE_INDEX[c[0]]]})
             ),
             
             4: lambda: (
-                update_common_indices(aa1_p, lambda codons: {x for c in codons for x in P_QUARTETS[NUCLEOTIDE_INDEX[c[-1]]]}),
-                update_common_indices(aa1_c, lambda codons: {x for c in codons for x in CODONS_TO_QUARTETS[CODON_INDEX[c]][1]}),
-                update_common_indices(aa2_p, lambda codons: {x for c in codons for x in N_QUARTETS[NUCLEOTIDE_INDEX[reverse_complement(c[-1])]]}),
-                update_common_indices(aa2_c, lambda codons: {x for c in codons for x in CODONS_TO_QUARTETS[CODON_INDEX[c]][3]})
+                update_common_indices(aa1_p, lambda codons: {x for c in codons for x in Constants.P_QUARTETS[Constants.NUCLEOTIDE_INDEX[c[-1]]]}),
+                update_common_indices(aa1_c, lambda codons: {x for c in codons for x in Constants.CODONS_TO_QUARTETS[Constants.CODON_INDEX[c]][1]}),
+                update_common_indices(aa2_p, lambda codons: {x for c in codons for x in Constants.N_QUARTETS[Constants.NUCLEOTIDE_INDEX[Constants._reverse_complement(c[-1])]]}),
+                update_common_indices(aa2_c, lambda codons: {x for c in codons for x in Constants.CODONS_TO_QUARTETS[Constants.CODON_INDEX[c]][3]})
             )
         }
         

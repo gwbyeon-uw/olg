@@ -2,6 +2,7 @@ import copy
 import math
 from typing import Dict, Tuple, List, Optional, Any
 from tqdm import tqdm
+import functools
 
 import numpy as np
 import torch
@@ -10,10 +11,31 @@ from constants import *
 from config import *
 from coordinates import *
 from compatibility import *
+    
 from wrappers.proteinmpnn import *
-from wrappers.esm3 import *
-from wrappers.coflow import *
-from wrappers.evodiff import *
+from wrappers.gremlin import *
+from wrappers.base_wrapper import ZeroOrderWrapper
+
+try:
+    from wrappers.coflow import *
+    coflow_avail = True
+except ImportError:
+    print("Skipping CoFlow wrapper")
+    coflow_avail = False
+
+try:    
+    from wrappers.esm3 import *
+    esm3_avail = True
+except ImportError:
+    print("Skipping ESM3 wrapper")
+    esm3_avail = False
+
+try:
+    from wrappers.evodiff import *
+    evodiff_avail = True
+except ImportError:
+    print("Skiping EvoDiff wrapper")
+    evodiff_avail = False
 
 class OLGDesign():
     def __init__(
@@ -96,9 +118,10 @@ class OLGDesign():
         
         decoder_classes = {
             "ProteinMPNN": WrapperProteinMPNN,
-            #"ESM3": WrapperESM3,
-            "CoFlow": WrapperCoFlow,
-            "EvoDiff": WrapperEvoDiff
+            "ZeroOrder": ZeroOrderWrapper,
+            "ESM3": WrapperESM3 if esm3_avail else None,
+            "CoFlow": WrapperCoFlow if coflow_avail else None,
+            "EvoDiff": WrapperEvoDiff if evodiff_avail else None
         }
         
         if decoder_type in decoder_classes:
@@ -212,7 +235,7 @@ class OLGDesign():
                 self.config.arrangement, 
                 (fixed_f1_prev, fixed_f1, fixed_f1_next), 
                 (fixed_f2_prev, fixed_f2, fixed_f2_next), 
-                self.codon_table_rev
+                self.compatibility.codon_table_rev
             )
             codon_compatibility_fixed_mask = torch.zeros(self.compatibility.codon_compatibility.shape, device=self.config.device).int()
             codon_compatibility_fixed_mask[:, :, :, :, :, compatible_q_i] = 1
@@ -692,6 +715,7 @@ class OLGDesign():
         if reset:
             self.reset_decoding(user_order=self.decoding_order_all)
         return (not failed, failed_res)
+      
 
 ### Unused
 '''
