@@ -377,7 +377,7 @@ class BoltzPHWrapper:
         """Wrapper for general garbage collection and aggressive cleanup."""
         gc.collect()
         torch.cuda.empty_cache()
-        aggressive_memory_cleanup()
+        BoltzPHWrapper.aggressive_memory_cleanup()
 
 #From https://github.com/yehlincho/Protein-Hunter/blob/main/boltz_ph/pipeline.py
 class InputDataBuilder:
