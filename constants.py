@@ -30,8 +30,8 @@ class Constants:
     }
     
     #High/low values for clamping and strong penalty
-    MAX_LOGIT = 1e3
-    MIN_LOGIT = -1e3
+    MAX_LOGIT = 1e6
+    MIN_LOGIT = -1e6
     
     #Alphabets and quartets that we use
     NUCLEOTIDES = list('ATGC')

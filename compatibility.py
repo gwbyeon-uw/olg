@@ -45,7 +45,8 @@ class CodonCompatibility:
             self.codon_table = unambiguous_dna_by_name[self.codon_table].forward_table #From Biopython NCBI codes 
             for stop_codon in unambiguous_dna_by_name["Standard"].stop_codons:
                 self.codon_table[stop_codon] = "X"
-        self.codon_table_rev = HashableDict(Constants._reverse_codon_table(self.codon_table))
+        #self.codon_table_rev = HashableDict(Constants._reverse_codon_table(self.codon_table))
+        self.codon_table_rev = Constants._reverse_codon_table(self.codon_table)
         self.codon_compatibility, self.quartets_aa = self.generate_compatibility_matrix(self.config.device, self.codon_table)
         
         #First/last nucleotide for each of the 256 quartets
@@ -167,12 +168,13 @@ class CodonCompatibility:
         return codon_compatibility, quartets_aa
 
     @staticmethod
-    @functools.lru_cache(maxsize=10000)
+    #@functools.lru_cache(maxsize=10000)
     def compatible_quartets_by_aa(
         arrangement: int,
         aa1s: Tuple[Optional[str]],
         aa2s: Tuple[Optional[str]],
-        codon_table_rev: HashableDict[str, List[str]]
+        #codon_table_rev: HashableDict[str, List[str]]
+        codon_table_rev: Dict[str, List[str]]
     ) -> np.ndarray:
         """
         Find compatible quartet indices based on amino acid constraints across different reading frames.
