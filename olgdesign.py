@@ -6,6 +6,7 @@ import functools
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from constants import *
 from config import *
@@ -142,7 +143,31 @@ class OLGDesign():
         self.decoding_orders_full[1] = self.coords.all_to_f2[self.decoding_order_all].clone()
         self.decoding_orders[1] = self.decoding_orders_full[1][self.decoding_orders_full[1]!=-1].unsqueeze(0)   
 
-    #Decode next step; this is the key function carrying out each step of iterative OLG decoding
+    @staticmethod
+    def move_to_first(tensor, index):
+        """
+        Move the element at 'index' to the first position and shift others down.
+        
+        Args:
+            tensor: Input tensor (1D)
+            index: Index of element to move to first position
+            
+        Returns:
+            Tensor with element at index moved to position 0
+        """
+        # Extract the element at the given index
+        element = tensor[index:index+1]
+        
+        # Concatenate: element + tensor[:index] + tensor[index+1:]
+        result = torch.cat([
+            element,
+            tensor[:index],
+            tensor[index+1:]
+        ])
+        
+        return result
+
+    # Decode next step; this is the key function carrying out each step of iterative OLG decoding
     def decode_next(
         self,
         dummy_run: Tuple[bool] = (False, False),
@@ -256,6 +281,7 @@ class OLGDesign():
             else:
                 print("Invalid; no available choice")
                 self.errored_compat = compatibility
+                self.errored_next_q = self.next_q
                 return False
             
         self.masked_logits_joint += [ masked_logits_joint.clone().detach() ]
@@ -429,20 +455,38 @@ class OLGDesign():
         self,
         dummy_run: Tuple[bool] = (False, False),
         mask_current: Tuple[bool] = (False, False),
+        retry: int = 0,
         force_safe: bool = False,
         dynamic_order: Optional[str] = None
         ) -> bool:
-        for i in tqdm(range(self.coords.total_len), disable=self.config.tqdm_disable):
-            if not self.decode_next(dummy_run=dummy_run, mask_current=mask_current, force_safe=force_safe):
-                return False
-            if dynamic_order is not None:
-                if (self.next_q > 0) and (self.next_q < self.coords.total_len):
-                    next_q = self.get_next_order_dyn(dynamic_order, frames=(True, True))
-                    self.swap_decoding_position(next_q)
-                    self.decoders[0]._reset_decoding_order(self.decoding_orders[0])
-                    self.decoders[1]._reset_decoding_order(self.decoding_orders[1])
-        return True    
-        
+        if retry > 0:
+            seed_S = (self.decoders[0].S.clone(), self.decoders[1].S.clone())
+        else:
+            seed_S = None
+
+        current_try = 0
+        while current_try <= retry:
+            for i in tqdm(range(self.coords.total_len), disable=self.config.tqdm_disable):
+                valid = self.decode_next(dummy_run=dummy_run, mask_current=mask_current, force_safe=force_safe)
+                if (not valid) and (retry > 0):
+                    #print("invalid, retrying")
+                    new_order = self.move_to_first(self.decoding_order_all, self.errored_next_q)
+                    self.reset_decoding(user_order=new_order, seed_S=seed_S)
+                    current_try += 1
+                    break
+                    
+                if dynamic_order is not None:
+                    if (self.next_q > 0) and (self.next_q < self.coords.total_len):
+                        next_q = self.get_next_order_dyn(dynamic_order, frames=(True, True))
+                        self.swap_decoding_position(next_q)
+                        self.decoders[0]._reset_decoding_order(self.decoding_orders[0])
+                        self.decoders[1]._reset_decoding_order(self.decoding_orders[1])
+
+            if valid:
+                return True 
+                
+        return False
+            
     def _map_score_positions(self, f1_score: torch.Tensor, f2_score: torch.Tensor) -> torch.Tensor:
         """Helper to handle coordinate mapping between absolute position and protein-relative position for decoding order function"""
         positions = torch.zeros((2, self.coords.total_len), device=self.config.device)
@@ -611,10 +655,12 @@ class OLGDesign():
         self,
         next_order: Optional[torch.Tensor] = None,
         weight: Tuple[torch.Tensor] = None,
+        seed_S: Tuple[torch.Tensor ] = None,
         seed_quartet: bool = False,
         force_safe: bool = False,
         dummy_run: Tuple[bool, bool] = (False, False),
-        dynamic_order: Optional[str] = None
+        dynamic_order: Optional[str] = None,
+        retry: int = 0
     ) -> None:
         """
         Run Gibbs/ICM style iterative refinement.
@@ -629,15 +675,27 @@ class OLGDesign():
         """
         w1, w2 = weight
         seed_quartet_list = self.quartet_list if seed_quartet else None
-        self.reset_decoding(user_order=next_order, seed_S=(self.decoders[0].S.clone(), self.decoders[1].S.clone()), seed_quartet_list=seed_quartet_list)
+        if seed_S is None:
+            seed_S = (self.decoders[0].S.clone(), self.decoders[1].S.clone())
+        self.reset_decoding(user_order=next_order, seed_S=seed_S, seed_quartet_list=seed_quartet_list)
         self.decoders[0].logit_weight = w1
         self.decoders[1].logit_weight = w2
-        self.decode_all(dummy_run=dummy_run, mask_current=(True, True), force_safe=force_safe, dynamic_order=dynamic_order) #Run decoding with current position masking
+        self.decode_all(dummy_run=dummy_run, mask_current=(True, True), force_safe=force_safe, retry=retry, dynamic_order=dynamic_order) #Run decoding with current position masking
 
+    def validate(self, keep_S: bool = False, retry: int = 10) -> bool:
+        """
+        Do a dry run to check if fixed positions, stop, and start codons are valid.
+        """
+        valid = self.decode_all(dummy_run=(True, True), force_safe=False, retry=retry)
+        if keep_S:
+            self.reset_decoding(user_order=self.decoding_order_all, seed_S=(self.decoders[0].S.clone(), self.decoders[1].S.clone()))
+        else:
+            self.reset_decoding(user_order=self.decoding_order_all)
+        return valid
+    
     #Check if fixed positions/stop/start make sense
     def validate_fixed(
         self,
-        prerun: bool = True,
         reset: bool = True,
         print_error: bool = True,
     ) -> bool:
@@ -645,15 +703,13 @@ class OLGDesign():
         Do a dry run to check if fixed positions, stop, and start codons are valid.
         
         Args:
-           prerun: Whether to run full decoding first
            reset: Whether to reset after validation
            print_error: Whether to print the failures
            
         Returns:
            tuple: (success_flag, list of failed positions)
         """
-        if prerun:
-            self.decode_all(dummy_run=(True, True), force_safe=True)
+        self.decode_all(dummy_run=(True, True), force_safe=True)
             
         S_f1, S_f2 = self.get_prot_seq()
         nuc_seq, quartets = self.string_quartet()
@@ -713,9 +769,26 @@ class OLGDesign():
                     print("Start could not be placed for protein 2")
         
         if reset:
-            self.reset_decoding(user_order=self.decoding_order_all)
+            self.reset_decoding(user_order=self.decoding_order_all, seed_S=(self.decoders[0].S.clone(), self.decoders[1].S.clone()))
         return (not failed, failed_res)
-      
+
+    @staticmethod
+    def per_position_entropy(indices: torch.Tensor, num_categories: int, epsilon: float = 1e-10):
+        """
+        Calculate per-position entropy for a BxL tensor of categorical indices.
+        
+        Args:
+            indices: torch.Tensor of shape (B, L) containing category indices
+            num_categories: int, total number of possible categories
+            
+        Returns:
+            torch.Tensor of shape (L,) containing entropy at each position
+        """
+        B, L = indices.shape
+        one_hot = F.one_hot(indices, num_classes=num_categories).float()
+        probs = one_hot.mean(dim=0)
+        entropy = -(probs * torch.log(probs + epsilon)).sum(dim=-1)
+        return entropy
 
 ### Unused
 '''
