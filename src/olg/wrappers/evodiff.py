@@ -6,8 +6,8 @@ import torch
 import numpy as np
 import numpy.typing as npt
 
-from constants import *
-from config import ProteinConfig
+from olg.constants import *
+from olg.config import ProteinConfig
 
 from evodiff.utils import Tokenizer
 from evodiff.pretrained import MSA_OA_DM_MAXSUB, ESM_MSA_1b #https://github.com/microsoft/evodiff/tree/main#loading-pretrained-models
@@ -32,6 +32,7 @@ class WrapperEvoDiff(BaseWrapper):
         self.use_esm_msa = use_esm_msa #Flag to use MSA Transformer instead of EvoDiff-MSA
         self.model = model
         self.tokenizer = tokenizer
+        self.vocab_size = len(self.tokenizer.alphabet)
     
         #MSA subsampling        
         self.msa_seqs = msa_seqs
@@ -295,34 +296,15 @@ class WrapperEvoDiff(BaseWrapper):
                 logits_[:, Constants.STOP_INDEX] = Constants.MIN_LOGIT #Zero out the index for X
 
                 logits = logits_.clone()
-                
-                #Repeat penalty
-                logits = self._apply_repetition_penalty(logits, t)
-                
-                #Final logits x some weight/temperature
-                logits = self._apply_weights_and_biases(logits, t)
-                
-                #These suppress some AA's on hard thresholding of their counts
-                aa_count = torch.nn.functional.one_hot(self.S[:,self.decoded_positions[0].bool()], num_classes=len(self.tokenizer.alphabet)).sum(1)[:, self.
-                alphabet_map]
-                max_aa = (aa_count >= self.config.max_aa_count)
-                logits[max_aa] = Constants.MIN_LOGIT
-    
-                #Positive AA total counts
-                if (aa_count[0, 6] + aa_count[0, 8] + aa_count[0, 14]) >= self.config.max_pos_count: #This is for positively charged AA's; H/K/R
-                    logits[0, 6] = Constants.MIN_LOGIT
-                    logits[0, 8] = Constants.MIN_LOGIT
-                    logits[0, 14] = Constants.MIN_LOGIT
-    
-                logits = BaseWrapper._top_p(logits, self.config.truncate_topp) #Top-p filtering
+                logits = self._apply_constraints(logits, t)
 
-            if (use_t_msa is None) and ((not self.config.force_stop) or (t != self.end_pos)): #Penalize stop codon if not at last position
+            if (use_t_msa is None) and ((not self.config.force_stop) or (t != self.end_pos)):
                 logits_ = self._penalize_stop(logits_)
                 logits = self._penalize_stop(logits)
-            
-            if (use_t_msa is None) and self.fixed_positions[t] != -1: #Everything is zero except fixed position
+
+            if (use_t_msa is None) and self.fixed_positions[t] != -1:
                 logits = self._force_fixed_positions(logits, t)
-    
+
             logits = BaseWrapper._add_noise(logits)
             return logits, logits_
     
@@ -369,7 +351,7 @@ class WrapperEvoDiff(BaseWrapper):
     
     #Update protein sequence vector S for fixing some regions that will not be part of OLG decoding
     def preset_fixed_S(self, fixed_start, fixed_end, fixed_seq):
-        t = torch.range(fixed_start, fixed_end, device=self.device)
+        t = torch.arange(fixed_start, fixed_end + 1, device=self.device)
         t_msa = self.gap_map[t] #Decoding position, relative to the MSA of the target protein
         fixed_token = self.alphabet_map[torch.tensor([ Constants.ALPHABET_GAP.index(c) for c in fixed_seq ], device=self.device)]
         self.edit_S(t_msa, fixed_token, inplace=True) #t here not relative to MSA

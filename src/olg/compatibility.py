@@ -1,4 +1,3 @@
-import functools
 import numpy as np
 import torch
 
@@ -6,31 +5,10 @@ from typing import Dict, Tuple, List, Optional
 
 from Bio.Data.CodonTable import unambiguous_dna_by_name
 
-from constants import *
-from config import DesignConfig
+from olg.constants import *
+from olg.config import DesignConfig
 
-class HashableDict(dict):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._hash = None
-    
-    def _make_hashable(self, obj):
-        if isinstance(obj, dict):
-            return tuple(sorted((k, self._make_hashable(v)) for k, v in obj.items()))
-        elif isinstance(obj, (list, tuple)):
-            return tuple(self._make_hashable(item) for item in obj)
-        elif isinstance(obj, set):
-            return frozenset(self._make_hashable(item) for item in obj)
-        return obj
-    
-    def __hash__(self):
-        if self._hash is None:
-            self._hash = hash(self._make_hashable(dict(self)))
-        return self._hash
-    
-    def __setitem__(self, key, value):
-        raise TypeError("HashableDict is immutable")
-        
+
 class CodonCompatibility:
     """Manages codon compatibility matrices and quartet operations"""
     def __init__(
@@ -40,12 +18,11 @@ class CodonCompatibility:
         self.config = config
         self.codon_table = self.config.codon_table
         if isinstance(self.codon_table, dict):
-            self.codon_table = codon_table
+            pass  # already a dict, use as-is
         else:
             self.codon_table = unambiguous_dna_by_name[self.codon_table].forward_table #From Biopython NCBI codes 
             for stop_codon in unambiguous_dna_by_name["Standard"].stop_codons:
                 self.codon_table[stop_codon] = "X"
-        #self.codon_table_rev = HashableDict(Constants._reverse_codon_table(self.codon_table))
         self.codon_table_rev = Constants._reverse_codon_table(self.codon_table)
         self.codon_compatibility, self.quartets_aa = self.generate_compatibility_matrix(self.config.device, self.codon_table)
         
@@ -168,12 +145,10 @@ class CodonCompatibility:
         return codon_compatibility, quartets_aa
 
     @staticmethod
-    #@functools.lru_cache(maxsize=10000)
     def compatible_quartets_by_aa(
         arrangement: int,
         aa1s: Tuple[Optional[str]],
         aa2s: Tuple[Optional[str]],
-        #codon_table_rev: HashableDict[str, List[str]]
         codon_table_rev: Dict[str, List[str]]
     ) -> np.ndarray:
         """

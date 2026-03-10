@@ -8,34 +8,41 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from constants import *
-from config import *
-from coordinates import *
-from compatibility import *
-    
-from wrappers.proteinmpnn import *
-from wrappers.gremlin import *
-from wrappers.base_wrapper import ZeroOrderWrapper
+from olg.constants import *
+from olg.config import *
+from olg.coordinates import *
+from olg.compatibility import *
+
+from olg.balancer import FrameBalancer
+from olg.exceptions import (
+    DecoderNotInitializedError,
+    DecodingError,
+    NoCompatibleQuartetError,
+)
+from olg.wrappers.protocol import DecoderProtocol
+from olg.wrappers.proteinmpnn import *
+from olg.wrappers.gremlin import *
+from olg.wrappers.base_wrapper import ZeroOrderWrapper
 
 try:
-    from wrappers.coflow import *
+    from olg.wrappers.coflow import *
     coflow_avail = True
 except ImportError:
     print("Skipping CoFlow wrapper")
     coflow_avail = False
 
 try:    
-    from wrappers.esm3 import *
+    from olg.wrappers.esm3 import *
     esm3_avail = True
 except ImportError:
     print("Skipping ESM3 wrapper")
     esm3_avail = False
 
 try:
-    from wrappers.evodiff import *
+    from olg.wrappers.evodiff import *
     evodiff_avail = True
 except ImportError:
-    print("Skiping EvoDiff wrapper")
+    print("Skipping EvoDiff wrapper")
     evodiff_avail = False
 
 class OLGDesign():
@@ -47,9 +54,14 @@ class OLGDesign():
         self.coords = Coordinates(self.config)
         self.compatibility = CodonCompatibility(self.config)
         
-        self.decoders = [ None, None ]
+        self.decoders: list[DecoderProtocol | None] = [None, None]
         self.decoding_orders = [ None, None ]
         self.decoding_orders_full = [ None, None ]
+        self.balancer = FrameBalancer(
+            max_weight=self.config.balancer_max_weight,
+            unit=self.config.balancer_unit,
+            threshold=self.config.balancer_threshold,
+        )
         self.reset_decoding()
 
     def reset_decoding(
@@ -99,12 +111,12 @@ class OLGDesign():
         self.logits_f1_ = [] #This will track logits at each decoding step before applying various weights and filters
         self.logits_f2_ = []
 
-        self.config.current_balancer_weight = self.config.balancer_unit
-        
+        self.balancer.reset()
+
         if self.decoders[0] is not None:
-            self.decoders[0].reset(self.decoding_orders[0], seed_S[0])
+            self.decoders[0].reset(self.decoding_orders[0], self.config.rand_base, seed_S=seed_S[0])
         if self.decoders[1] is not None:
-            self.decoders[1].reset(self.decoding_orders[1], seed_S[1])
+            self.decoders[1].reset(self.decoding_orders[1], self.config.rand_base, seed_S=seed_S[1])
 
     def initialize_decoder(self, decoder_type: str, frame: int, model: Any, **kwargs):
         shared_params = {
@@ -120,13 +132,16 @@ class OLGDesign():
         decoder_classes = {
             "ProteinMPNN": WrapperProteinMPNN,
             "ZeroOrder": ZeroOrderWrapper,
+            "GREMLIN": WrapperGREMLIN,
             "ESM3": WrapperESM3 if esm3_avail else None,
             "CoFlow": WrapperCoFlow if coflow_avail else None,
-            "EvoDiff": WrapperEvoDiff if evodiff_avail else None
+            "EvoDiff": WrapperEvoDiff if evodiff_avail else None,
         }
-        
-        if decoder_type in decoder_classes:
-            self.decoders[frame] = decoder_classes[decoder_type](model, **kwargs)
+
+        cls = decoder_classes.get(decoder_type)
+        if cls is None:
+            raise ValueError(f"Unknown or unavailable decoder type: {decoder_type!r}")
+        self.decoders[frame] = cls(model, **kwargs)
         
     def swap_decoding_position(self, t_q_next: int) -> None:
         """
@@ -172,21 +187,18 @@ class OLGDesign():
         self,
         dummy_run: Tuple[bool] = (False, False),
         mask_current: Tuple[bool] = (False, False),
-        mask_quartet: bool = False,
         force_safe: bool = False
     ) -> bool:
         """
         This is the key function that performs each step of iterative sampling with overlap constraint
-        
+
         Args:
            dummy_run: Whether to run in dummy mode for each frame
            mask_current: Whether to mask current position before sampling
-           mask_quartet: currently unused
            force_safe: Force safe fallback if no valid choices available
         """
         if (self.decoders[0] is None) or (self.decoders[1] is None):
-            print("Decoders not initialized")
-            return False
+            raise DecoderNotInitializedError("Both decoders must be initialized before decoding")
 
         #Step index and positions
         t_q = self.decoding_order_all[self.next_q] #Position of the current quartet
@@ -255,7 +267,7 @@ class OLGDesign():
         fixed_f2_next = self.coords.fixed_positions_set[1][t_f2+1] if 0 < ((t_f2 + 1) < self.coords.f2_gap_len) else None
 
         compatibility_safe = compatibility.clone()
-        if not ((fixed_f1 == None) and (fixed_f1_prev == None) and (fixed_f1_next == None) and (fixed_f2 == None) and (fixed_f2_prev == None) and (fixed_f2_next == None)):
+        if any(x is not None for x in [fixed_f1, fixed_f1_prev, fixed_f1_next, fixed_f2, fixed_f2_prev, fixed_f2_next]):
             compatible_q_i = self.compatibility.compatible_quartets_by_aa(
                 self.config.arrangement, 
                 (fixed_f1_prev, fixed_f1, fixed_f1_next), 
@@ -279,10 +291,9 @@ class OLGDesign():
                 quartets_logits_joint[compatibility_safe] = Constants.MIN_LOGIT #Mask joint logits matrix with compatibility matrix
                 masked_logits_joint = torch.clamp(quartets_logits_joint, min=Constants.MIN_LOGIT)
             else:
-                print("Invalid; no available choice")
                 self.errored_compat = compatibility
                 self.errored_next_q = self.next_q
-                return False
+                raise NoCompatibleQuartetError(self.next_q)
             
         self.masked_logits_joint += [ masked_logits_joint.clone().detach() ]
                 
@@ -326,16 +337,8 @@ class OLGDesign():
             f1_S_t = best_q[1][0].unsqueeze(0).unsqueeze(0)
             
             if self.config.complexed:
-                t_full = self.decoders[0].decoding_order[0, self.decoders[0].next_t_full]
-                t_ = self.decoders[0].decoding_order_target[0, self.decoders[0].next_t*self.decoders[0].n_design_chains]
-
-                if self.decoders[0].tied:
-                    tied_list = self.decoders[0].tied_pos[t_]
-                else:
-                    tied_list = [ t_ ]
-                for t in tied_list:
-                    self.decoders[1].edit_S(t, f1_S_t, inplace=True) #Decodes from the other frame if it was part of same complex
-            
+                for t in self.decoders[0].get_tied_positions():
+                    self.decoders[1].edit_S(t, f1_S_t, inplace=True)
             elif self.config.shared:
                 self.decoders[1].edit_S(t_f1, f1_S_t, inplace=True)
             
@@ -345,16 +348,8 @@ class OLGDesign():
             f2_S_t = best_q[2][0].unsqueeze(0).unsqueeze(0)
             
             if self.config.complexed:
-                t_full = self.decoders[1].decoding_order[0, self.decoders[1].next_t_full]
-                t_ = self.decoders[1].decoding_order_target[0, self.decoders[1].next_t*self.decoders[1].n_design_chains]
-            
-                if self.decoders[1].tied:
-                    tied_list = self.decoders[1].tied_pos[t_]
-                else:
-                    tied_list = [ t_ ]
-                for t in tied_list:
-                    self.decoders[0].edit_S(t, f2_S_t, inplace=True) #Decodes from the other frame if it was part of same complex
-                
+                for t in self.decoders[1].get_tied_positions():
+                    self.decoders[0].edit_S(t, f2_S_t, inplace=True)
             elif self.config.shared:
                 self.decoders[0].edit_S(t_f2, f2_S_t, inplace=True)
                     
@@ -409,7 +404,7 @@ class OLGDesign():
         for n in range(len(nt_p_1s)):
             if nt_p_1s[n] in nt_qn_1s:
                 acceptable += [ n ]
-        quartet_list[0] = quartet_list[0][np.random.choice(acceptable)]
+        quartet_list[0] = quartet_list[0][torch.randint(len(acceptable), (1,)).item()]
 
         #Second to second-last quartet; look to neighboring quartets and choose randomly among the acceptable (connecting) quartets
         for q in range(1, len(quartet_list)-1, 1):
@@ -422,19 +417,19 @@ class OLGDesign():
                 if nt_q_1s[n] == nt_qp_4:
                     if nt_p_1s[n] in nt_qn_1s:
                         acceptable += [ n ]
-            quartet_list[q] = quartet_list[q][np.random.choice(acceptable)]
+            quartet_list[q] = quartet_list[q][torch.randint(len(acceptable), (1,)).item()]
 
         #last quartet; look to previous quartet and choose randomly among the acceptable (connecting) quartets
         acceptable = []
-        nt_q_1s = self.compatibility.next_quartet_index[quartet_list[len(quartet_list)-1]]
-        nt_qp_4 = self.compatibility.prev_quartet_index[quartet_list[len(quartet_list)-2]]
+        nt_q_1s = self.compatibility.next_quartet_index[quartet_list[-1]]
+        nt_qp_4 = self.compatibility.prev_quartet_index[quartet_list[-2]]
         for n in range(len(nt_q_1s)):
             if nt_q_1s[n] == nt_qp_4:
                 acceptable += [ n ]
-        quartet_list[len(quartet_list)-1] = quartet_list[len(quartet_list)-1][np.random.choice(acceptable)]
+        quartet_list[-1] = quartet_list[-1][torch.randint(len(acceptable), (1,)).item()]
 
         #Trim last nucleotide if in-phase overlap (-0)
-        final_nuc = ''.join([ Constants.QUARTETS[q][0:3] for q in quartet_list ] + [ Constants.QUARTETS[quartet_list[len(quartet_list)-1]][-1] ])
+        final_nuc = ''.join([ Constants.QUARTETS[q][0:3] for q in quartet_list ] + [ Constants.QUARTETS[quartet_list[-1]][-1] ])
         self.nuc = torch.tensor([ Constants.NUCLEOTIDES.index(c) for c in final_nuc ], device=self.config.device)
         return final_nuc, quartet_list
 
@@ -466,15 +461,19 @@ class OLGDesign():
 
         current_try = 0
         while current_try <= retry:
+            failed = False
             for i in tqdm(range(self.coords.total_len), disable=self.config.tqdm_disable):
-                valid = self.decode_next(dummy_run=dummy_run, mask_current=mask_current, force_safe=force_safe)
-                if (not valid) and (retry > 0):
-                    #print("invalid, retrying")
-                    new_order = self.move_to_first(self.decoding_order_all, self.errored_next_q)
-                    self.reset_decoding(user_order=new_order, seed_S=seed_S)
-                    current_try += 1
-                    break
-                    
+                try:
+                    self.decode_next(dummy_run=dummy_run, mask_current=mask_current, force_safe=force_safe)
+                except NoCompatibleQuartetError:
+                    if retry > 0:
+                        new_order = self.move_to_first(self.decoding_order_all, self.errored_next_q)
+                        self.reset_decoding(user_order=new_order, seed_S=seed_S)
+                        current_try += 1
+                        failed = True
+                        break
+                    raise
+
                 if dynamic_order is not None:
                     if (self.next_q > 0) and (self.next_q < self.coords.total_len):
                         next_q = self.get_next_order_dyn(dynamic_order, frames=(True, True))
@@ -482,10 +481,10 @@ class OLGDesign():
                         self.decoders[0]._reset_decoding_order(self.decoding_orders[0])
                         self.decoders[1]._reset_decoding_order(self.decoding_orders[1])
 
-            if valid:
-                return True 
-                
-        return False
+            if not failed:
+                return True
+
+        raise DecodingError(f"decode_all failed after {retry} retries")
             
     def _map_score_positions(self, f1_score: torch.Tensor, f2_score: torch.Tensor) -> torch.Tensor:
         """Helper to handle coordinate mapping between absolute position and protein-relative position for decoding order function"""
@@ -502,13 +501,13 @@ class OLGDesign():
         
         return positions
     
-    def _apply_masks_and_sort(self, positions: torch.Tensor, priortize_fixed: bool):
+    def _apply_masks_and_sort(self, positions: torch.Tensor, prioritize_fixed: bool):
         """Apply masks and sort positions to get decoding order"""
         positions = positions.mean(0)
         positions = positions / positions.max()  # Scale values so that highest value is 1
         positions = positions - self.coords.start_mask_all - self.coords.end_stop_mask_all
         
-        if priortize_fixed:
+        if prioritize_fixed:
             positions = positions - self.coords.fixed_positions_mask_all
         
         if self.config.decoding_mode == DecodingMode.OVERLAP_FIRST:
@@ -522,7 +521,7 @@ class OLGDesign():
         self,
         ordering: str = "entropy",
         frames: Tuple[bool, bool] = (True, True),
-        priortize_fixed: bool = True
+        prioritize_fixed: bool = True
     ) -> int:
         """
         Next position based on current preds
@@ -530,7 +529,7 @@ class OLGDesign():
         Args:
            ordering: Ordering strategy ("entropy" or "prob")
            frames: Which frames to consider
-           priortize_fixed: Whether to prioritize fixed positions
+           prioritize_fixed: Whether to prioritize fixed positions
            
         Returns:
            int: Next position to decode
@@ -566,20 +565,20 @@ class OLGDesign():
 
             positions = self._map_score_positions(f1_max_log_prob, f2_max_log_prob)
 
-        next_order = self._apply_masks_and_sort(positions, priortize_fixed)
+        next_order = self._apply_masks_and_sort(positions, prioritize_fixed)
         return next_order[~torch.isin(next_order, self.decoding_order_all[0:self.next_q])][0]
         
     def get_next_order(
         self,
         ordering: str = "entropy",
-        priortize_fixed: bool = True
+        prioritize_fixed: bool = True
     ) -> torch.Tensor:
         """
         Generate decoding order based on probs; should be run after computing pseudolikelihoods for both frame
         
         Args:
            ordering: Ordering strategy ("entropy", "prob", "prob_rank", "random", "orig")
-           priortize_fixed: Whether to prioritize fixed positions
+           prioritize_fixed: Whether to prioritize fixed positions
            
         Returns:
            torch.Tensor: Decoding order indices
@@ -612,44 +611,22 @@ class OLGDesign():
             prob_rank_2 += prob_2 * Constants.EPS
             positions = self._map_score_positions(prob_rank_1, prob_rank_2)
             
-        return self._apply_masks_and_sort(positions, priortize_fixed)
+        return self._apply_masks_and_sort(positions, prioritize_fixed)
 
     def get_next_weight(
-        self, 
-        scores_pll: List[[torch.Tensor, torch.Tensor]]
+        self,
+        scores_pll: List,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Heuristics for calculating weights to balance the two frames.
-        It will look at the last two scores in the history and increment the current balancing weight if the signs are the same.
+        """Compute per-frame weight tensors to balance the two reading frames.
 
-        Args:
-            scores_pll: pseudolikelihood history
-        Returns:
-            tuple: (frame1_weights, frame2_weights)
+        Delegates to self.balancer (FrameBalancer).
         """
-        scores_0 = [ scores_pll[-1][0], scores_pll[-1][1] ]
-        sd0 = scores_0[1] - scores_0[0]
-        
-        if len(scores_pll) > 1: #Must have at least 2 items in the history to compare, else default to just looking at the last one            
-            scores_1 = [ scores_pll[-2][0], scores_pll[-2][1] ]
-            sd1 = scores_1[1] - scores_1[0]
-            
-            if (torch.sign(sd1) == torch.sign(sd0)) and (torch.abs(sd0) > self.config.balancer_threshold):
-                self.config.current_balancer_weight = self.config.current_balancer_weight + self.config.balancer_unit
-            else:
-                self.config.current_balancer_weight = self.config.balancer_unit
-        else:
-            self.config.current_balancer_weight = self.config.balancer_unit
-
-        diff = torch.abs(sd0)
-        weight = min(self.config.balancer_max_weight, diff * self.config.current_balancer_weight + 1.0)
-        if scores_pll[-1][1] > scores_pll[-1][0]:
-            w1 = torch.ones(self.decoders[0].logit_weight.shape, device=self.decoders[0].logit_weight.device)
-            w2 = torch.ones(self.decoders[1].logit_weight.shape, device=self.decoders[1].logit_weight.device) * weight
-        else:
-            w1 = torch.ones(self.decoders[0].logit_weight.shape, device=self.decoders[0].logit_weight.device) * weight
-            w2 = torch.ones(self.decoders[1].logit_weight.shape, device=self.decoders[1].logit_weight.device)
-        return w1, w2
+        return self.balancer.get_weights(
+            scores_pll,
+            shape_f1=self.decoders[0].logit_weight.shape,
+            shape_f2=self.decoders[1].logit_weight.shape,
+            device=self.decoders[0].logit_weight.device,
+        )
         
     def decode_all_gibbs(
         self,
@@ -686,7 +663,11 @@ class OLGDesign():
         """
         Do a dry run to check if fixed positions, stop, and start codons are valid.
         """
-        valid = self.decode_all(dummy_run=(True, True), force_safe=False, retry=retry)
+        try:
+            self.decode_all(dummy_run=(True, True), force_safe=False, retry=retry)
+            valid = True
+        except (DecodingError, NoCompatibleQuartetError):
+            valid = False
         if keep_S:
             self.reset_decoding(user_order=self.decoding_order_all, seed_S=(self.decoders[0].S.clone(), self.decoders[1].S.clone()))
         else:
@@ -734,7 +715,7 @@ class OLGDesign():
                     
         if self.config.protein1.force_stop:
             q_i = quartets[self.coords.f1_to_all[-1]]
-            aa_f1 = self.compatibility.quartets_aa[q_i][FRAME_F1[self.config.arrangement]] 
+            aa_f1 = self.compatibility.quartets_aa[q_i][Constants.FRAME_F1[self.config.arrangement]]
             aa_i = Constants.STOP_INDEX
             if aa_f1 != aa_i:
                 failed = True
@@ -744,7 +725,7 @@ class OLGDesign():
 
         if self.config.protein2.force_stop:
             q_i = quartets[self.coords.f2_to_all[-1]]
-            aa_f2 = self.compatibility.quartets_aa[q_i][FRAME_F2[self.config.arrangement]] 
+            aa_f2 = self.compatibility.quartets_aa[q_i][Constants.FRAME_F2[self.config.arrangement]]
             aa_i = Constants.STOP_INDEX
             if aa_f2 != aa_i:
                 failed = True
@@ -764,7 +745,7 @@ class OLGDesign():
             q_i = quartets[self.coords.f2_to_all[0]]
             if q_i not in self.compatibility.start_codons_quartets[1]:
                 failed = True
-                failed_res += [ (0, 1, 'Start') ]
+                failed_res += [ (1, 1, 'Start') ]
                 if print_error:
                     print("Start could not be placed for protein 2")
         
@@ -790,133 +771,3 @@ class OLGDesign():
         entropy = -(probs * torch.log(probs + epsilon)).sum(dim=-1)
         return entropy
 
-### Unused
-'''
-    def nuc_pos_to_aa_pos(
-        self,
-        nuc_pos: int
-    ) -> Tuple[Tuple[Optional[int]]]:
-        """
-        Given nucleotide position, get amino acid positions relative to each protein
-        
-        Args:
-           nuc_pos: Nucleotide position
-           
-        Returns:
-           tuple: ((f1_pos, f1_pos_target, f1_codon_pos), 
-                   (f2_pos, f2_pos_target, f2_codon_pos))
-        """
-        f1_offset, f2_offset, reverse = Constants.ARRANGEMENT_CONFIG[self.config.arrangement]
-        
-        # Calculate f1 position
-        f1_pos = math.floor((nuc_pos - f1_offset) / 3)
-        f1_pos_target = f1_pos - self.coords.f1_start
-        f1_codon_pos = (nuc_pos - f1_offset) % 3
-        f1_in_range = (f1_pos >= self.coords.f1_start) and (f1_pos < self.coords.f1_end) and \
-                      (f1_pos_target >= 0) and (f1_pos_target < (self.config.protein1.length + self.config.protein1.force_stop))
-        
-        # Calculate f2 position
-        f2_pos = math.floor((nuc_pos - f2_offset) / 3)
-        f2_pos_target = (self.coords.f2_end - 1 - f2_pos) if reverse else (f2_pos - self.coords.f2_start)
-        f2_codon_pos = (nuc_pos - f2_offset) % 3
-        f2_in_range = (f2_pos >= self.coords.f2_start) and (f2_pos < self.coords.f2_end) and \
-                      (f2_pos_target >= 0) and (f2_pos_target < (self.config.protein2.length + self.config.protein2.force_stop))
-        
-        f1_res = (f1_pos, f1_pos_target, f1_codon_pos) if f1_in_range else (None, None, None)
-        f2_res = (f2_pos, f2_pos_target, f2_codon_pos) if f2_in_range else (None, None, None)
-        return f1_res, f2_res
-
-    def best_nuc_change(
-        self,
-        nuc_pos: int,
-        nuc_temp: Optional[torch.Tensor] = None
-    ) -> None:
-        """
-        Find and apply best nucleotide change at given position.
-        
-        Args:
-           nuc_pos: Nucleotide position to optimize
-           nuc_temp: Temporary nucleotide sequence (uses self.nuc if None)
-        """
-        if nuc_temp is not None:
-            nuc = nuc_temp
-        else:
-            nuc = self.nuc
-            
-        (f1_pos, f1_pos_target, f1_codon_pos), (f2_pos, f2_pos_target, f2_codon_pos) = self.nuc_pos_to_aa_pos(nuc_pos)
-        
-        logits_f1 = torch.zeros((1, Constants.ALPHABET_SIZE), device=self.config.device)
-        logits_f1_ = torch.zeros((1, Constants.ALPHABET_SIZE), device=self.config.device)
-        logits_f2 = torch.zeros((1, Constants.ALPHABET_SIZE), device=self.config.device)
-        logits_f2_ = torch.zeros((1, Constants.ALPHABET_SIZE), device=self.config.device)
-        f1_all_aa = torch.zeros(Constants.NUCLEOTIDE_SIZE, device=self.config.device).long()
-        f2_all_aa = torch.zeros(Constants.NUCLEOTIDE_SIZE, device=self.config.device).long()
-
-        if f1_pos is not None:
-            f1_codon_start = nuc_pos - f1_codon_pos
-            f1_codon_end = f1_codon_start + 3
-            f1_codon = nuc[f1_codon_start:f1_codon_end].unsqueeze(0) #if positive; else revcomp
-            f1_all_codons = f1_codon.repeat((4, 1)) #All 4 possible nucleotides
-            f1_all_codons[:, f1_codon_pos] = torch.arange(4, device=self.config.device) 
-            f1_all_aa = self.compatibility.codon_to_aa[f1_all_codons[:, 0], f1_all_codons[:, 1], f1_all_codons[:, 2]] #Translate
-            if f1_pos_target < self.decoders[0].decoded_positions.shape[1]:
-                self.decoders[0].decoded_positions[0, f1_pos_target] = 0
-            logits_f1, logits_f1_ = self.decoders[0].decode_next(mask_current=True, use_t=f1_pos_target)
-        if f2_pos is not None:
-            f2_codon_start = nuc_pos - f2_codon_pos
-            f2_codon_end = f2_codon_start + 3
-            f2_codon = nuc[f2_codon_start:f2_codon_end].unsqueeze(0) #if positive; else revcomp
-            f2_all_codons = f2_codon.repeat((4, 1))
-            f2_all_codons[:, f2_codon_pos] = torch.arange(4, device=self.config.device)
-            if self.f2_neg:
-                f2_all_aa = self.compatibility.codon_to_aa_rc[f2_all_codons[:, 0], f2_all_codons[:, 1], f2_all_codons[:, 2]]
-            else:
-                f2_all_aa = self.compatibility.codon_to_aa[f2_all_codons[:, 0], f2_all_codons[:, 1], f2_all_codons[:, 2]]
-            if f2_pos_target < self.decoders[1].decoded_positions.shape[1]:
-                self.decoders[1].decoded_positions[0, f2_pos_target] = 0
-            logits_f2, logits_f2_ = self.decoders[1].decode_next(mask_current=True, use_t=f2_pos_target)
-        
-        best_nuc = torch.stack([ logits_f1[0, f1_all_aa], logits_f2[0, f2_all_aa] ]).mean(0).argmax()
-        current_nuc = nuc[nuc_pos]
-        nuc[nuc_pos] = best_nuc
-
-        if f1_pos_target is not None:
-            if f1_pos_target < self.decoders[0].decoded_positions.shape[1]:
-                self.decoders[0].update_S(f1_all_aa[best_nuc], use_t=f1_pos_target, alphabet_map=True)
-        if f2_pos_target is not None:
-            if f2_pos_target < self.decoders[1].decoded_positions.shape[1]:
-                self.decoders[1].update_S(f2_all_aa[best_nuc], use_t=f2_pos_target, alphabet_map=True)
-                
-    #Iterate Gibbs/ICM style passes at nucleotide level
-    def mutate_all_gibbs(
-        self,
-        ordering: str = "entropy",
-        aw_max: float = 0.25,
-        aw_scale: float = 0.25,
-        scores: Optional[Tuple[float, float]] = None
-    ) -> None:
-        """
-        Run Gibbs/ICM style refinement at nucleotide level.
-        
-        Args:
-           ordering: Ordering strategy
-           aw_max: Maximum weight adjustment
-           aw_scale: Weight scaling factor
-           scores: Current scores
-        """
-        if scores is None:
-            scores = self.get_scores()
-
-        next_order = self.get_next_order(ordering) if ordering != "orig" else None
-        pos_ind = torch.arange(self.nuc_total_len)
-        pos_ind_ = np.concatenate([ np.random.permutation(pos_ind[(quartet_pos*3):(quartet_pos*3+4)]) for quartet_pos in self.decoding_order_all.cpu().numpy() ])
-        pos_ind_uniq, pos_ind_uniq_ind = np.unique(pos_ind_, return_index=True)
-        next_order_nuc = torch.tensor(pos_ind_uniq[pos_ind_uniq_ind.argsort()], device=self.config.device)
-        
-        weight = min(aw_max, scores[1] / scores[0] - 1.0) * aw_scale + 1.0
-        w1 = self.decoders[0].logit_weight
-        w2 = self.decoders[1].logit_weight * weight * 100
-
-        for nuc_pos in tqdm(next_order_nuc, disable=self.config.tqdm_disable):
-            self.best_nuc_change(nuc_pos)
-'''

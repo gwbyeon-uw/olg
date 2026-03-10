@@ -5,10 +5,10 @@ from typing import Optional, Tuple, List, Any
 import torch
 import numpy as np
 
-from constants import *
-from config import ProteinConfig
+from olg.constants import *
+from olg.config import ProteinConfig
 
-from .protein_mpnn_utils import gather_nodes, cat_neighbors_nodes, _scores, parse_PDB, StructureDatasetPDB, ProteinMPNN
+from ._vendored.protein_mpnn_utils import gather_nodes, cat_neighbors_nodes, _scores, parse_PDB, StructureDatasetPDB, ProteinMPNN
 from .base_wrapper import BaseWrapper
 
 class WrapperProteinMPNN(BaseWrapper):
@@ -504,8 +504,8 @@ class WrapperProteinMPNN(BaseWrapper):
                 if not self.tied:
                     t_list = [ t ]    
                 else:
-                    next_t = (self.decoding_order_e[0]==use_t).nonzero().item()    
-                    self.decoding_order_target[0, (next_t*self.n_design_chains):((next_t+1)*self.n_design_chains)]
+                    next_t = (self.decoding_order_e[0]==use_t).nonzero().item()
+                    t_list = self.decoding_order_target[0, (next_t*self.n_design_chains):((next_t+1)*self.n_design_chains)]
                 
         else:
             t = self.decoding_order[0, self.next_t_full] #Decoding position, relative to target protein
@@ -755,7 +755,14 @@ class WrapperProteinMPNN(BaseWrapper):
             S = self.S[:, self.target_chain_offset:(self.target_chain_offset+self.target_chain_length)] #Sequence for only design target chain
         prot = ''.join([Constants.ALPHABET[s.item()] for s in S[0, :]])
         return prot
-        
+
+    def get_tied_positions(self) -> list[int]:
+        """All tied positions for current step (multimer symmetry)."""
+        t_ = self.decoding_order_target[0, self.next_t * self.n_design_chains]
+        if self.tied:
+            return self.tied_pos[t_].tolist()
+        return [t_.item()]
+
     def decode_all(
         self, 
         temp: float = 1e-12, 

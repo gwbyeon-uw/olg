@@ -1,5 +1,7 @@
 #From https://github.com/parizkh/resource-conservation-in-genetic-code
 
+from pathlib import Path
+
 import numpy as np
 import pandas
 
@@ -32,7 +34,8 @@ def gen_neighbouring_codons_tv(c):
     return res
 
 # the Grantham matrix of amino acid distances; Grantham, Science, 1974
-grantham_matrix = pandas.read_csv("data/grantham.tsv", sep="\t", index_col = 0)
+_grantham_path = Path(__file__).resolve().parent / "data" / "grantham.tsv"
+grantham_matrix = pandas.read_csv(_grantham_path, sep="\t", index_col=0) if _grantham_path.exists() else None
 
 def read_code(fileName):
     code = {}
@@ -267,6 +270,8 @@ def get_neighbouring_blocks(bl, blocks):
     return [b for b in blocks if set(b) & set(neighbours)]
 
 def rand_random_expansion(seed = 0):
+    if grantham_matrix is None:
+        raise RuntimeError(f"Grantham matrix not found at {_grantham_path}; required for rand_random_expansion")
     np.random.seed(seed)
     # dictionary to store the code
     code = {}
@@ -359,6 +364,8 @@ fixed_aas ... a dictionary in the form index:aa, index is index of a block, aa t
     assigned to this block; None if not applicable (no blocks with fixed meaning)
 '''
 def rand_massey_2_3_shuffler(blocks, parents, fixed_aas = None, seed = 0):
+    if grantham_matrix is None:
+        raise RuntimeError(f"Grantham matrix not found at {_grantham_path}; required for rand_massey_2_3_shuffler")
     np.random.seed(seed)
     # list of amino acids
     aminoacids = ['A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L', 'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y']

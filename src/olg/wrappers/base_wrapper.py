@@ -1,4 +1,4 @@
-from typing import Any, Tuple, Optional
+from typing import Tuple, Optional
 import string
 
 import torch
@@ -7,79 +7,8 @@ import numpy as np
 import numpy.typing as npt
 from scipy.spatial.distance import squareform
 
-from constants import *
-from config import ProteinConfig
-
-class GuidanceWrapper:
-    def __init__(
-        self,
-        device: torch.device,
-        config: Any,
-        rand_base: float
-    ):
-        self.device = device
-        self.config = config
-        self.rand_base = rand_base
-
-    @staticmethod
-    def unconditional_rate(xt: torch.Tensor, logits: torch.Tensor, stochasticity: float, t: float, temp: float) -> torch.Tensor: # B, L, C
-        pt_x1_probs = F.softmax(logits / temp, dim=-1)
-        xt_is_mask = (xt == self.mask_idx).view(1, logits.shape[1], 1).float()
-        R_t = xt_is_mask * pt_x1_probs * ((1 + stochasticity * t) / (1 - t)) # B, L, C
-        remask_rates = (1 - xt_is_mask) * stochasticity
-        R_t += remask_rates
-        return R_t
-
-    @staticmethod
-    def rate_to_prob(xt: torch.Tensor, R_t: torch.Tensor, dt: float, log_prob: bool) -> torch.Tensor:
-        # Set the diagonal of the rates to negative row sum
-        R_t.scatter_(-1, xt[:, :, None], 0.0)
-        R_t.scatter_(-1, xt[:, :, None], (-R_t.sum(dim=-1, keepdim=True)))
-
-        # Obtain probabilities from the rates
-        step_probs = (R_t * dt).clamp(min=0.0, max=1.0)
-        step_probs.scatter_(-1, xt[:, :, None], 0.0)
-        step_probs.scatter_(
-            -1,
-            xt[:, :, None],
-            (1.0 - torch.sum(step_probs, dim=-1, keepdim=True)).clamp(min=0.0),
-        )
-        step_probs = torch.clamp(step_probs, min=0.0, max=1.0)
-        
-        if log_prob:
-            return torch.log(step_probs)
-        else:
-            return step_probs
-
-    @staticmethod
-    def guided_rate(
-        log_prob_ratio: torch.Tensor, 
-        R_t: torch.Tensor, 
-        guide_temp: float = 1.0, 
-        log_prob_ratio_cutoff: float = 80.0
-    ) -> torch.Tensor:
-        log_prob_ratio /= guide_temp # Scale log prob ratio by temperature
-        log_prob_ratio = torch.clamp(log_prob_ratio, max=log_prob_ratio_cutoff) # Clamp the log prob ratio
-        prob_ratio = torch.exp(log_prob_ratio) # Exponentiate to get p(y|x=z~) / p(y|x=z_t)
-        R_t = R_t * prob_ratio # Multiply the reverse rate elementwise with the density ratio
-        return R_t
-        
-    def conditional_rate(self, current_S: torch.Tensor) -> torch.Tensor: # S = B, L, C
-        # Taylor-approximated guidance (TAG) based on https://github.com/hnisonoff/discrete_guidance/blob/main/src/fm_utils.py
-        S = current_S.clone()
-        # \grad_{x}{log p(y|x)}(z_t), shape (B, L, C)
-        with torch.enable_grad():
-            S.requires_grad_(True)
-            # log p(y|x=z_t), shape (B,)
-            log_prob = self.predictor(S)
-            log_prob.sum().backward()
-            # Shape (B, L, C)
-            grad_log_prob = S.grad
-        # 1st order Taylor approximation of the log difference
-        # Shape (B, L, C)
-        log_prob_ratio = grad_log_prob - (S * grad_log_prob).sum(dim=-1, keepdim=True)
-
-        return log_prob_ratio
+from olg.constants import *
+from olg.config import ProteinConfig
 
 class BaseWrapper:
     """
@@ -181,6 +110,28 @@ class BaseWrapper:
     def _force_fixed_positions(self, logits: torch.Tensor, t: int) -> torch.Tensor:
         logits = torch.zeros(Constants.ALPHABET_SIZE, device=self.device).unsqueeze(0)
         logits[0, self.fixed_positions[t]] = Constants.MAX_LOGIT #High number to force fixed residue
+        return logits
+
+    def _apply_constraints(self, logits: torch.Tensor, t: int) -> torch.Tensor:
+        """Apply non-dummy constraints: repetition penalty, weights/biases, AA count suppression, top-p.
+
+        Shared across all non-ProteinMPNN wrappers. Called only in the non-dummy path,
+        after logit extraction, centering, alphabet mapping, and stop-index zeroing.
+        """
+        logits = self._apply_repetition_penalty(logits, t)
+        logits = self._apply_weights_and_biases(logits, t)
+
+        aa_count = F.one_hot(
+            self.S[:, self.decoded_positions[0].bool()], num_classes=self.vocab_size
+        ).sum(1)[:, self.alphabet_map]
+        logits[aa_count >= self.config.max_aa_count] = Constants.MIN_LOGIT
+
+        if (aa_count[0, 6] + aa_count[0, 8] + aa_count[0, 14]) >= self.config.max_pos_count:
+            logits[0, 6] = Constants.MIN_LOGIT
+            logits[0, 8] = Constants.MIN_LOGIT
+            logits[0, 14] = Constants.MIN_LOGIT
+
+        logits = BaseWrapper._top_p(logits, self.config.truncate_topp)
         return logits
 
     @staticmethod
@@ -293,9 +244,10 @@ class ZeroOrderWrapper(BaseWrapper):
         temperature: float = 1.0,
         **kwargs
     ):
-        super().__init__(**kwargs)   
+        super().__init__(**kwargs)
         self.temp = temperature
         self.logits = model
+        self.vocab_size = self.logits.shape[1]
 
         self.alphabet_map = torch.arange(Constants.ALPHABET_SIZE, device=self.device) #Dummy
         self.alphabet_map_rev = torch.arange(Constants.ALPHABET_SIZE, device=self.device) #Dummy
@@ -350,12 +302,11 @@ class ZeroOrderWrapper(BaseWrapper):
     def get_logits(self): # Dummy, always returns logit tensor
         return self.logits
         
-    #Decode next step; returns AA logits
     def decode_next(self, dummy_run=False, mask_current=False, use_t=None):
         if use_t is not None:
             t = use_t
         else:
-            t = self.decoding_order[0, self.next_t] #Decoding position, relative to target protein
+            t = self.decoding_order[0, self.next_t]
 
         if dummy_run:
             self.current_logits = torch.zeros(self.logits.shape, device=self.device)
@@ -363,46 +314,27 @@ class ZeroOrderWrapper(BaseWrapper):
             self.current_logits = self.get_logits()
 
         if t > -1:
-            if self.config.force_stop and (t == self.end_pos): #Everything is zero except stop index
+            if self.config.force_stop and (t == self.end_pos):
                 logits = self._force_stop()
                 return logits, logits
-            
-            if dummy_run:
-                logits_ = self.current_logits.clone()[:, self.alphabet_map] #Only the alphabet we use
-                #logits_[:, Constants.STOP_INDEX] = Constants.MIN_LOGIT #Zero out the index for X
-                logits = logits_.clone() 
-            else:
-                logits_ = self.current_logits.clone()[:, self.alphabet_map] #Only first row and standard AAs; only the alphabet we use
-                logits_ -= logits_.mean()
-                logits_[:, Constants.STOP_INDEX] = Constants.MIN_LOGIT #Zero out the index for X
-                logits = logits_.clone()
 
-                #Repeat penalty
-                logits = self._apply_repetition_penalty(logits, t)
-                
-                #Final logits x some weight/temperature
-                logits = self._apply_weights_and_biases(logits, t)
-                            
-                #These suppress some AA's on hard thresholding of their counts
-                aa_count = torch.nn.functional.one_hot(self.S[:,self.decoded_positions[0].bool()], num_classes=self.logits.shape[1]).sum(1)[:, self.alphabet_map]
-                max_aa = (aa_count >= self.config.max_aa_count)
-                logits[max_aa] = Constants.MIN_LOGIT
-    
-                #Positive AA total counts
-                if (aa_count[0, 6] + aa_count[0, 8] + aa_count[0, 14]) >= self.config.max_pos_count: #This is for positively charged AA's; H/K/R
-                    logits[0, 6] = Constants.MIN_LOGIT
-                    logits[0, 8] = Constants.MIN_LOGIT
-                    logits[0, 14] = Constants.MIN_LOGIT
-                            
-                logits = BaseWrapper._top_p(logits, self.config.truncate_topp) #Top-p filtering
-    
-            if ((not self.config.force_stop) or (t != self.end_pos)): #Penalize stop codon if not at last position
+            if dummy_run:
+                logits_ = self.current_logits.clone()[:, self.alphabet_map]
+                logits = logits_.clone()
+            else:
+                logits_ = self.current_logits.clone()[:, self.alphabet_map]
+                logits_ -= logits_.mean()
+                logits_[:, Constants.STOP_INDEX] = Constants.MIN_LOGIT
+                logits = logits_.clone()
+                logits = self._apply_constraints(logits, t)
+
+            if (not self.config.force_stop) or (t != self.end_pos):
                 logits_ = self._penalize_stop(logits_)
                 logits = self._penalize_stop(logits)
-                
-            if self.fixed_positions[t] != -1: #Everything is zero except fixed position
+
+            if self.fixed_positions[t] != -1:
                 logits = self._force_fixed_positions(logits, t)
-                
+
             logits = BaseWrapper._add_noise(logits)
             return logits, logits_
 
@@ -456,6 +388,15 @@ class ZeroOrderWrapper(BaseWrapper):
             S = self.alphabet_map_rev[self.S[0, self.config.start_offset:self.config.length]]
         prot = ''.join([Constants.ALPHABET[s] for s in S])
         return prot
+
+    def get_tied_positions(self) -> list[int]:
+        """Positions to update together with current decode step.
+
+        Default: current position only. Override in subclasses that support
+        tied/symmetric decoding (e.g. ProteinMPNN multimer).
+        """
+        t = self.decoding_order[0, self.next_t]
+        return [t.item()]
 
     def decode_all(
         self, 
