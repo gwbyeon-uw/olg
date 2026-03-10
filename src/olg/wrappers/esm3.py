@@ -4,25 +4,18 @@ from typing import Optional, Tuple, List, Any
 
 import torch
 import torch.nn as nn
-from torch.distributions.categorical import Categorical
 import numpy as np
 
-from esm.tokenization import EsmSequenceTokenizer
-import esm.utils.constants.esm3 as C
+from olg.constants import *
+from olg.config import ProteinConfig
 
-from .CoFlow.model import CoFlowModel
-
-from constants import *
-from config import ProteinConfig
 from .base_wrapper import BaseWrapper
 
-class WrapperCoFlow(BaseWrapper):
+class WrapperESM3(BaseWrapper):
     def __init__(
         self,
         model: nn.Module, 
         prefixed_seq: Optional[Tuple[int, int, str]] = None,
-        sample_struct: bool = True,
-        sample_struct_temp: float = 0.7,
         **kwargs
     ):
         """
@@ -30,15 +23,10 @@ class WrapperCoFlow(BaseWrapper):
         super().__init__(**kwargs)
 
         self.model = model
-        self.sample_struct = sample_struct
-        self.sample_struct_temp = sample_struct_temp
-        self.tokenizer = EsmSequenceTokenizer().vocab
-        self.mask_idx = C.SEQUENCE_MASK_TOKEN
-        self.bos_idx = C.SEQUENCE_BOS_TOKEN
-        self.eos_idx = C.SEQUENCE_EOS_TOKEN
-        self.struct_mask_idx = C.STRUCTURE_MASK_TOKEN
-        self.struct_bos_idx = C.STRUCTURE_BOS_TOKEN
-        self.struct_eos_idx = C.STRUCTURE_EOS_TOKEN
+        self.tokenizer = self.model.tokenizers.sequence.vocab
+        self.mask_idx = self.tokenizer['<mask>']
+        self.cls_idx = self.tokenizer['<cls>']
+        self.eos_idx = self.tokenizer['<eos>']
         self.vocab_size = len(self.tokenizer)
         self.alphabet_map = torch.tensor([ self.tokenizer[l] for l in Constants.ALPHABET ], device=self.device) #Index we use to ESM3 index
         self.alphabet_map_rev = torch.arange(self.vocab_size, device=self.device)
@@ -47,6 +35,7 @@ class WrapperCoFlow(BaseWrapper):
             if a in Constants.ALPHABET:
                 self.alphabet_map_rev[i] = Constants.ALPHABET.index(a)
         
+        self.L = self.config.length + 2
         self.prefixed_seq = prefixed_seq #List of tuples, (start, end, seq)
             
         tmp = torch.zeros(self.config.length, device=self.device) - 1 #Position relative to target protein
@@ -55,22 +44,14 @@ class WrapperCoFlow(BaseWrapper):
                 tmp[pos-1] = Constants.ALPHABET.index(aa)
         self.fixed_positions = tmp.long() #This will have -1 non-fixed positions and AA index at fixed positions    
         
-        self.reset(self.decoding_order, self.rand_base)
-
-    @staticmethod
-    def _load_coflow_model(device: torch.device, weight_path: str):
-        model = CoFlowModel.from_pretrained(weight_path)
-        model = model.to(device)
-        model = model.eval()
-        model.requires_grad_(False)
-        return model
+        self.reset(self.decoding_order, self.rand_base)    
 
     def _reset_decoding_order(self, decoding_order):
         self.decoding_order = decoding_order #This is relative to target chain's position in the OLG decoder. It is NOT the positions for X/S from PDB and need to be offseted
         self.end_pos = torch.max(self.decoding_order)
     
     #Resets decoding; sequences are emptied and various trackers are set to zero
-    def reset(self, decoding_order, rand_base, seed_S=None, seed_structure=None):
+    def reset(self, decoding_order, rand_base, seed_S=None, seed_tracks=None):
         self.rand_base = rand_base
         self._reset_decoding_order(decoding_order)
         
@@ -92,34 +73,55 @@ class WrapperCoFlow(BaseWrapper):
                 for fixed_start, fixed_end, fixed_seq in self.prefixed_seq:
                     self.preset_fixed_S(fixed_start, fixed_end, fixed_seq) #This will update S, S_msa and decoded positions
 
-        if seed_structure is None: #Other than sequence_tokens
-            self.structure_tokens = torch.ones((1, self.config.length)).long().to(self.device)
-            self.structure_tokens = self.structure_tokens.fill_(C.STRUCTURE_MASK_TOKEN)
-        else:
-            self.structure_tokens = seed_structure
+        if seed_tracks is None: #Other than sequence_tokens
+            '''
+            sequence_tokens (torch.Tensor, optional): The amino acid tokens.
+            structure_tokens (torch.Tensor, optional): The structure tokens.
+            ss8_tokens (torch.Tensor, optional): The secondary structure tokens.
+            sasa_tokens (torch.Tensor, optional): The solvent accessible surface area tokens.
+            function_tokens (torch.Tensor, optional): The function tokens.
+            residue_annotation_tokens (torch.Tensor, optional): The residue annotation tokens.
+            average_plddt (torch.Tensor, optional): The average plddt across the entire sequence.
+            per_res_plddt (torch.Tensor, optional): The per residue plddt, if you want to specify exact plddts, use this,
+                otherwise, use average_plddt.
+            structure_coords (torch.Tensor, optional): The structure coordinates, in the form of (B, L, 3, 3).
+            chain_id (torch.Tensor, optional): The chain ID
+            sequence_id (torch.Tensor, optional): The sequence ID.
+            '''
+            seed_tracks = { 'structure_tokens': None, 'ss8_tokens': None, 'sasa_tokens': None,
+                            'function_tokens': None, 'residue_annotation_tokens': None,
+                            'average_plddt': torch.tensor(1.0, device=self.device),
+                            'per_res_plddt': torch.ones((1, self.L), device=self.device),
+                            'structure_coords': None, 'chain_id': None, 'sequence_id': None }
+        self.structure_tokens = seed_tracks['structure_tokens']
+        self.ss8_tokens = seed_tracks['ss8_tokens']
+        self.sasa_tokens = seed_tracks['sasa_tokens']
+        self.function_tokens = seed_tracks['function_tokens']
+        self.residue_annotation_tokens = seed_tracks['residue_annotation_tokens']
+        self.average_plddt = seed_tracks['average_plddt']
+        self.per_res_plddt = seed_tracks['per_res_plddt']
+        self.structure_coords = seed_tracks['structure_coords']
+        self.chain_id = seed_tracks['chain_id']
+        self.sequence_id = seed_tracks['sequence_id']
         
         self.gap_map = torch.arange(self.decoding_order.shape[1], device=self.device) #Dummy
         self.gap_map_rev = self.gap_map.clone()
-        self.dt = 1.0 / self.config.length
-        self.last_struct_logits = None
 
-    def pad_seq(self, input_seq: torch.Tensor, input_type="sequence"):
-        input_seq = torch.nn.functional.pad(input_seq, (1,1))
-        input_seq[0, 0] = self.bos_idx if input_type == "sequence" else self.struct_bos_idx
-        input_seq[0, -1] = self.eos_idx if input_type == "sequence" else self.struct_eos_idx
-        return input_seq
-        
     def get_logits(self):
-        tc = self.get_current_tc(self.S)
-        struct_logits, seq_logits = self.model.denoise(structure=self.structure_tokens, sequence=self.S, t=tc)
-        return seq_logits[0, :, 0:self.vocab_size], struct_logits[0]
-
-    def get_current_tc(self, S):
-        tc = (1.0 - (S[0, ] == self.mask_idx).sum() * self.dt).unsqueeze(0).unsqueeze(0) #Timestep for the model, linear; 1 - masked proportion
-        return tc
+        input_seq = torch.nn.functional.pad(self.S, (1,1))
+        input_seq[0, 0] = self.cls_idx
+        input_seq[0, -1] = self.eos_idx
+        out = self.model.forward(sequence_tokens=input_seq, 
+                                 structure_tokens=self.structure_tokens, ss8_tokens=self.ss8_tokens, 
+                                 sasa_tokens=self.sasa_tokens, function_tokens=self.function_tokens,
+                                 residue_annotation_tokens=self.residue_annotation_tokens,
+                                 average_plddt=self.average_plddt, per_res_plddt=self.per_res_plddt, 
+                                 structure_coords=self.structure_coords, chain_id=self.chain_id, 
+                                 sequence_id=self.sequence_id)
+        return out.sequence_logits[:, 1:-1, 0:self.vocab_size]
         
     #Decode next step; returns AA logits
-    def decode_next(self, dummy_run=False, mask_current=False, use_t=None, use_current_pred=False, only_pred=False):
+    def decode_next(self, dummy_run=False, mask_current=False, use_t=None):
         if use_t is not None:
             t = use_t
         else:
@@ -130,11 +132,7 @@ class WrapperCoFlow(BaseWrapper):
         else:
             if mask_current:
                 self.S[0, t] = self.mask_idx
-            if not use_current_pred:
-                self.current_pred, self.current_pred_struct = self.get_logits()
-
-        if only_pred:
-            return None, None
+            self.current_pred = self.get_logits()[0]
 
         if t > -1:
             if self.config.force_stop and (t == self.end_pos): #Everything is zero except stop index
@@ -145,40 +143,22 @@ class WrapperCoFlow(BaseWrapper):
             
             if dummy_run:
                 logits_ = self.current_logits.clone()[:, self.alphabet_map] #Only the alphabet we use
-                logits_[:, Constants.STOP_INDEX] = Constants.MIN_LOGIT #Zero out the index for X
+                #logits_[:, Constants.STOP_INDEX] = Constants.MIN_LOGIT #Zero out the index for X
                 logits = logits_.clone() 
             else:
-                logits_ = self.current_logits.clone()[:, self.alphabet_map] #Only first row and standard AAs; only the alphabet we use
+                logits_ = self.current_logits.clone()[:, self.alphabet_map]
                 logits_ -= logits_.mean()
-                logits_[:, Constants.STOP_INDEX] = Constants.MIN_LOGIT #Zero out the index for X
+                logits_[:, Constants.STOP_INDEX] = Constants.MIN_LOGIT
                 logits = logits_.clone()
+                logits = self._apply_constraints(logits, t)
 
-                #Repeat penalty
-                logits = self._apply_repetition_penalty(logits, t)
-                
-                #Final logits x some weight/temperature
-                logits = self._apply_weights_and_biases(logits, t)
-                            
-                #These suppress some AA's on hard thresholding of their counts
-                aa_count = torch.nn.functional.one_hot(self.S[:,self.decoded_positions[0].bool()], num_classes=self.vocab_size).sum(1)[:, self.alphabet_map]
-                max_aa = (aa_count >= self.config.max_aa_count)
-                logits[max_aa] = Constants.MIN_LOGIT
-    
-                #Positive AA total counts
-                if (aa_count[0, 6] + aa_count[0, 8] + aa_count[0, 14]) >= self.config.max_pos_count: #This is for positively charged AA's; H/K/R
-                    logits[0, 6] = Constants.MIN_LOGIT
-                    logits[0, 8] = Constants.MIN_LOGIT
-                    logits[0, 14] = Constants.MIN_LOGIT
-                            
-                logits = BaseWrapper._top_p(logits, self.config.truncate_topp) #Top-p filtering
-    
-            if ((not self.config.force_stop) or (t != self.end_pos)): #Penalize stop codon if not at last position
+            if (not self.config.force_stop) or (t != self.end_pos):
                 logits_ = self._penalize_stop(logits_)
                 logits = self._penalize_stop(logits)
-                
-            if self.fixed_positions[t] != -1: #Everything is zero except fixed position
+
+            if self.fixed_positions[t] != -1:
                 logits = self._force_fixed_positions(logits, t)
-                
+
             logits = BaseWrapper._add_noise(logits)
             return logits, logits_
         
@@ -215,35 +195,11 @@ class WrapperCoFlow(BaseWrapper):
         self.selected_log_prob[:, t] = log_softmax[S_t]
         self.log_prob[t, :] = log_softmax
         self.argmax_aa[:, t] = self.current_logits[0].argmax()
-
-        if self.sample_struct:
-            self.sample_struct_single(t, dummy_run=dummy_run)
-
         return True
-
-    def sample_struct_single(self, t, dummy_run=False):
-        if not dummy_run:
-            if t < self.config.length:
-                self.structure_tokens[0, t] = C.STRUCTURE_MASK_TOKEN
-                _, struct_logits = self.get_logits()
-                struct_probs = torch.softmax(struct_logits/self.sample_struct_temp, dim=-1)    
-                self.structure_tokens[0, t] = Categorical(struct_probs[t, :]).sample()
-
-    def sample_struct_all(self, n_steps: int, temp: float, eta: float, purity: bool):
-        structure = self.structure_tokens.clone()
-        structure_mask = structure == C.STRUCTURE_MASK_TOKEN
-        for idx in range(n_steps):
-            t = torch.Tensor([[idx/n_steps]]).to(self.device)
-            struc_logits, _ = self.model.denoise(structure=structure, sequence=self.S, t=t)
-            struc_probs = torch.softmax(struc_logits/self.sample_struct_temp, dim=-1)
-            structure = self.model.flow._sample_next_single(
-                probs=struc_probs, xt=self.structure_tokens, mask_token=C.STRUCTURE_MASK_TOKEN, mask=structure_mask,
-                N=n_steps, step=idx, eta=eta, purity=purity, sample=True)
-        return structure
     
     #Update protein sequence vector S for fixing some regions that will not be part of OLG decoding
     def preset_fixed_S(self, fixed_start, fixed_end, fixed_seq):
-        t = torch.range(fixed_start, fixed_end, device=self.device)
+        t = torch.arange(fixed_start, fixed_end + 1, device=self.device)
         fixed_token = self.alphabet_map[torch.tensor([ Constants.ALPHABET.index(c) for c in fixed_seq ], device=self.device)]
         self.edit_S(t, fixed_token, inplace=True) #t here not relative to MSA
         self.decoded_positions[:, t] = 1.0

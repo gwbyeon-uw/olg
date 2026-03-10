@@ -1,3 +1,27 @@
-# Jupyter Notebook
-.ipynb_checkpoints
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
 */.ipynb_checkpoints/*
+
+# Weights & large binaries
+weights/
+bin/
+*.ckpt
+*.pt
+*.pth
+
+# Examples (large notebooks, scaffolds, data)
+examples/
+
+# Planning docs
+IMPLEMENTATION_PLAN.md
+
+# Experimental (broken, not ready for use)
+src/olg/wrappers/guidance.py

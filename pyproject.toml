@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "olg"
+version = "0.1.0"
+description = "Overlapping gene design using generative protein sequence models"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "numpy",
+    "scipy",
+    "biopython",
+    "tqdm",
+    "pandas",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+boltz = ["boltz"]
+evodiff = ["evodiff"]
+esm = ["esm"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

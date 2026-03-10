@@ -1,8 +1,7 @@
-import numpy as np
 import torch
 
-from constants import Arrangement, DecodingMode
-from config import DesignConfig
+from olg.constants import Arrangement
+from olg.config import DesignConfig
 
 class Coordinates:
     """Manages coordinate transformations between proteins and absolute positions given the design setup"""
@@ -86,37 +85,3 @@ class Coordinates:
                 self.fixed_positions_mask_all[self.f2_to_all[pos-1]] = 1.0 # 3e8 + i
                 self.fixed_positions_set[1][pos-1] = aa        
 
-    '''
-    def absolute_to_protein(
-        self, 
-        pos: torch.Tensor, 
-        protein_idx: int
-    ) -> torch.Tensor:
-        """Convert absolute position to protein-relative position"""
-        if protein_idx == 0:
-            return self.all_to_f1[pos]
-        else:
-            return self.all_to_f2[pos]
-    
-    def protein_to_absolute(
-        self, 
-        pos: torch.Tensor,
-        protein_idx: int
-    ) -> torch.Tensor:
-        """Convert protein-relative position to absolute position"""
-        if protein_idx == 0:
-            return self.f1_to_all[pos]
-        else:
-            return self.f2_to_all[pos]
-
-    def protein_to_other(
-        self, 
-        pos: torch.Tensor,
-        protein_idx: int
-    ) -> torch.Tensor:
-        """Convert position relative to one protein to the position relative to the other"""
-        if protein_idx == 0:
-            return self.f1_to_f2[pos]
-        else:
-            return self.f2_to_f1[pos]
-    '''

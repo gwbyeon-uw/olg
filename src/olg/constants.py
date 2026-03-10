@@ -29,9 +29,9 @@ class Constants:
         2: (0, 0, True),
     }
     
-    #High/low values for clamping and strong penalty
-    MAX_LOGIT = 1e6
-    MIN_LOGIT = -1e6
+    #High/low values for clamping and strong penalty (float16-safe: max ~65504)
+    MAX_LOGIT = 1e4
+    MIN_LOGIT = -1e4
     
     #Alphabets and quartets that we use
     NUCLEOTIDES = list('ATGC')

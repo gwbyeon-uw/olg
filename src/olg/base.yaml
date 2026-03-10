@@ -1,0 +1,45 @@
+# OLG Design Configuration — Base Defaults
+# Override any field by specifying it in your config YAML.
+
+device: "cuda:0"
+arrangement: 0          # 0=+1, 1=-1, 2=-0, 3=+2, 4=-2
+offset: 0
+codon_table: "Standard"
+decoding_mode: 1         # 0=random, 1=overlap_first, 2=overlap_last
+temperature: 1.0
+top_p: 0.0               # 0.0 = greedy
+complexed: false
+shared: false
+balancer_max_weight: 2.0
+balancer_unit: 0.5
+balancer_threshold: 0.15
+rand_base: null
+tqdm_disable: false
+
+protein1:
+  length: 100
+  start_offset: 0
+  force_stop: false
+  force_start: false
+  start_codons: ["ATG"]
+  fixed_positions: null
+  gap_positions: null
+  repetition_penalty: 1.1
+  repetition_penalty_window: 4
+  truncate_topp: 0.0
+  max_pos_count: 10000.0
+  # Tensor fields (logit_weight, logit_bias, aa_bias, max_aa_count)
+  # are omitted — initialized from length in __post_init__
+
+protein2:
+  length: 100
+  start_offset: 0
+  force_stop: false
+  force_start: false
+  start_codons: ["ATG"]
+  fixed_positions: null
+  gap_positions: null
+  repetition_penalty: 1.1
+  repetition_penalty_window: 4
+  truncate_topp: 0.0
+  max_pos_count: 10000.0
