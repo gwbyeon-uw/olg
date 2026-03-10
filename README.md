@@ -1,4 +1,4 @@
-# OLG: Overlapping Gene Design
+# OLGDesign
 
 Design two proteins whose coding sequences overlap in different reading frames of the same DNA.
 
