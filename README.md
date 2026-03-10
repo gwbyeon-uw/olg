@@ -10,14 +10,14 @@ This framework uses generative protein models to design synthetic OLGs. The core
 
 ## Supported models
 
-| Model | Frame types | Notes |
-|-------|------------|-------|
-| **ProteinMPNN** | Structure-conditioned | Supports complexes via tied decoding |
-| **ESM3** | Structure/sequence-conditioned | Requires `esm` package |
-| **CoFlow** | Structure-conditioned | Requires `coflow` package |
-| **EvoDiff-MSA** | MSA-conditioned | Requires `evodiff` package; supports shared MSA mode |
-| **GREMLIN** | MSA-conditioned | Built-in, no extra deps |
-| **ZeroOrder** | Sequence frequency baseline | Built-in |
+| Model | Notes |
+|-------|-------|
+| **ProteinMPNN** | Supports complexes via tied decoding |
+| **ESM3** | Requires `esm` package |
+| **CoFlow** | Requires `coflow` package |
+| **EvoDiff-MSA** | Requires `evodiff` package; supports shared MSA mode |
+| **GREMLIN** | Built-in, no extra deps |
+| **ZeroOrder** | Built-in dummy model (uniform logits) |
 
 Any combination of models can be used (one per frame).
 
