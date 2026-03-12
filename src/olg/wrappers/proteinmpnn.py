@@ -1,6 +1,6 @@
 from tqdm import tqdm
 
-from typing import Optional, Tuple, List, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import numpy as np
@@ -23,11 +23,13 @@ class WrapperProteinMPNN(BaseWrapper):
         tied: bool = False,
         tied_weight: Optional[List[Tuple[str, float]]] = [],
         fixed_chain_seq: Optional[List[Tuple[str]]] = [],
+        pad: Optional[List[List[int]]] = None,
+        chain_mask: Optional[List] = None,
         **kwargs
     ):
         """
         Initialize ProteinMPNN container with model and design parameters.
-        
+
         Args:
             model: Pre-loaded model (if None, loads from decoder_path)
             ca_only: Use only CA atoms
@@ -38,19 +40,28 @@ class WrapperProteinMPNN(BaseWrapper):
             tied: Whether to use tied decoding for symmetric design
             tied_weight: Weights for tied positions (chain_letter, weight)
             fixed_chain_seq: List of (chain_letter, sequence) for fixed chains
+            pad: Per-chain padding as [[pad_left, pad_right], ...], one entry per
+                chain in all_chains order. Padded positions get zero coordinates
+                and mask=0. None means no padding.
+            chain_mask: Per-chain masks, one entry per chain in all_chains order.
+                Each entry can be: None (no masking), a list of int positions
+                within that chain to force mask=0, or an array/tensor of shape
+                [chain_length] used as the base mask (1=valid, 0=masked).
         """
         super().__init__(**kwargs)
-        
+
         self.ca_only = ca_only
         self.model = model
-        self._set_target_from_pdb(pdb_path, fixed_chains, design_chains, undecoded_chains, tied, tied_weight, fixed_chain_seq)
+        self._set_target_from_pdb(pdb_path, fixed_chains, design_chains, undecoded_chains,
+                                  tied, tied_weight, fixed_chain_seq, pad=pad, chain_mask=chain_mask)
 
         self.alphabet_map = torch.arange(Constants.ALPHABET_SIZE, device=self.device) #Dummy
         self.alphabet_map_rev = torch.arange(Constants.ALPHABET_SIZE, device=self.device) #Dummy
-        
+
         self.reset(self.decoding_order, self.rand_base)
-    
-    def _set_target_from_pdb(self, pdb_path, fixed_chains=[], design_chains=["A"], undecoded_chains=[], tied=False, tied_weight=[], fixed_chain_seq=[]):
+
+    def _set_target_from_pdb(self, pdb_path, fixed_chains=[], design_chains=["A"], undecoded_chains=[], tied=False, tied_weight=[], fixed_chain_seq=[],
+                             pad=None, chain_mask=None):
         self.pdb_data, self.chain_id = self._process_pdb(pdb_path, self.ca_only, fixed_chains, design_chains, undecoded_chains)
         self.fixed_chains, self.design_chains, self.undecoded_chains, self.all_chains = self.chain_id
         self.fixed_chain_seq = fixed_chain_seq #list of tuples (chain_letter, seq)
@@ -58,8 +69,10 @@ class WrapperProteinMPNN(BaseWrapper):
         self.n_design_chains = len(self.design_chains)
         self.n_fixed_chains = len(self.fixed_chains)
         self.n_undecoded_chains = len(self.undecoded_chains) #Chains to be left undecoded; useful for pairing with a residue in the other frame's container instance for hetero-multimer design
-        
-        self.X, self.S_orig, self.mask, self.chain_encoding, self.residue_idx = self._featurize(self.device, self.pdb_data, self.chain_id, self.ca_only) # Featurize structure
+
+        self.X, self.S_orig, self.mask, self.chain_encoding, self.residue_idx = self._featurize(
+            self.device, self.pdb_data, self.chain_id, self.ca_only, pad=pad, chain_mask=chain_mask
+        ) # Featurize structure
         self.target_chain = self.design_chains[0] #There can be multiple design chains for tied option, but only first one will be the "main" chain
         self.chain_lengths = [ (self.chain_encoding[0, :] == self.all_chains.index(chain_letter)).sum() for chain_letter in self.all_chains ]
         self.chain_offsets = [ torch.nonzero(self.chain_encoding[0, :] == self.all_chains.index(chain_letter))[0][0] for chain_letter in self.all_chains ]
@@ -154,13 +167,17 @@ class WrapperProteinMPNN(BaseWrapper):
         device: torch.device,
         pdb: Dict[str, Any],
         chain_id: Tuple[List[str], List[str], List[str], List[str]],
-        ca_only: bool = False
+        ca_only: bool = False,
+        pad: Optional[List[List[int]]] = None,
+        chain_mask: Optional[List] = None,
     ) -> Tuple[torch.Tensor]:
         """
         Featurize protein structure data. Simpler rewrite of tied_featurize from ProteinMPNN.
         Orders and concatenates coordinates (X) and sequences (S) across chains.
-        Also returns position encoded residue index, mask and chain encoding
-        
+        Also returns position encoded residue index, mask and chain encoding.
+
+        Supports per-chain padding with dummy residues and per-chain masking.
+
         Args:
             device: torch.device
             pdb: Dictionary containing protein structure data with keys like:
@@ -170,7 +187,15 @@ class WrapperProteinMPNN(BaseWrapper):
             chain_id: Tuple of (fixed_chains, design_chains, undecoded_chains, all_chains)
                 where each element is a list of chain letters
             ca_only: If True, only use CA (alpha carbon) coordinates
-        
+            pad: Per-chain padding as [[pad_left, pad_right], ...], one entry per
+                chain in all_chains order. Padded positions get zero coordinates
+                and mask=0. None means no padding for any chain.
+            chain_mask: Per-chain masks, one entry per chain in all_chains order.
+                Each entry can be:
+                - None: no additional masking for this chain
+                - list[int]: positions within the chain to force mask=0
+                - np.ndarray of shape [chain_length]: base mask (1=valid, 0=masked)
+
         Returns:
             Tuple containing:
                 - X: Coordinate tensor of shape [1, L, 3] if ca_only else [1, L, 4, 3]
@@ -179,62 +204,103 @@ class WrapperProteinMPNN(BaseWrapper):
                 - chain_encodings: Chain ID encodings [1, L], starting from 1
                 - residue_idx: Position-encoded residue indices [1, L]
         """
-        total_length = len(pdb['seq']) #sum of chain seq lengths
-        if ca_only: #Dimensions for X
-            X = np.zeros([1, total_length, 1, 3])
-        else:
-            X = np.zeros([1, total_length, 4, 3])
-            
-        S = np.zeros([1, total_length], dtype=np.int32) #Sequence tokens
         fixed_chains, design_chains, undecoded_chains, all_chains = chain_id #Lists of chain letters
-        
-        chain_encodings = np.zeros([1, total_length], dtype=np.int32) #First chain is 1
-        residue_idx = -100 * np.ones([1, total_length], dtype=np.int32) #Residue encodings
-        
+        n_chains = len(all_chains)
+        n_atoms = 1 if ca_only else 4
+
         X_chains = []
         chain_seqs = []
         chain_start = 0
-        for chain_id, chain_letter in enumerate(all_chains):
+
+        chain_encodings_parts = []
+        residue_idx_parts = []
+        mask_parts = []
+
+        for c_id, chain_letter in enumerate(all_chains):
             chain_seq = pdb["seq_chain_"+chain_letter]
             chain_seq = ''.join([a if a!='-' else 'X' for a in chain_seq]) #Replace - with X
             chain_length = len(chain_seq)
             chain_coords = pdb["coords_chain_"+chain_letter] #this is a dictionary
-            
+
             if ca_only:
-                X_chain = np.array(chain_coords["CA_chain_"+chain_letter]) #[chain_length,1,3] #CA_diff
+                X_chain = np.array(chain_coords["CA_chain_"+chain_letter]) #[chain_length,1,3]
                 if len(X_chain.shape) == 2:
                     X_chain = X_chain[:, None, :]
             else:
                 X_chain = np.stack([chain_coords[c] for c in ["N_chain_"+chain_letter, "CA_chain_"+chain_letter, "C_chain_"+chain_letter, "O_chain_"+chain_letter]], 1) #[chain_length,4,3]
-    
+
+            # Per-chain padding
+            pad_n = pad[c_id][0] if (pad is not None and c_id < len(pad)) else 0
+            pad_c = pad[c_id][1] if (pad is not None and c_id < len(pad)) else 0
+
+            if pad_n > 0:
+                X_chain = np.concatenate([np.zeros([pad_n, n_atoms, 3]), X_chain], axis=0)
+                chain_seq = "G" * pad_n + chain_seq
+
+            if pad_c > 0:
+                X_chain = np.concatenate([X_chain, np.zeros([pad_c, n_atoms, 3])], axis=0)
+                chain_seq = chain_seq + "G" * pad_c
+
+            padded_length = chain_length + pad_n + pad_c
+
             X_chains.append(X_chain)
             chain_seqs.append(chain_seq)
-            
-            chain_end = chain_start + chain_length
-            chain_encodings[0, chain_start:chain_end] = chain_id
-            residue_idx[0, chain_start:chain_end] = 100 * chain_id + np.arange(chain_start, chain_end) #Residue indices are encoded as 100*chain_id + position
-            chain_start += chain_length
-            
-        #X and S
-        X[0, :, :, :] = np.concatenate(X_chains, 0) #[L, 4, 3]
-        isnan = np.isnan(X)
-        X[isnan] = 0. #Handle missing coordinates by setting them to 0 and masking
-        mask = np.isfinite(np.sum(X, (2, 3))).astype(np.float32)
-        
+
+            # Build per-chain mask: start from coordinate validity, then apply padding and user mask
+            chain_mask_arr = np.isfinite(np.sum(X_chain, (1, 2))).astype(np.float32) # [padded_length]
+            X_chain[np.isnan(X_chain)] = 0. # Replace NaN with 0 after mask computation
+
+            # Padded positions always get mask=0
+            if pad_n > 0:
+                chain_mask_arr[:pad_n] = 0.0
+            if pad_c > 0:
+                chain_mask_arr[-pad_c:] = 0.0
+
+            # Apply per-chain user mask
+            if chain_mask is not None and c_id < len(chain_mask) and chain_mask[c_id] is not None:
+                cm = chain_mask[c_id]
+                if isinstance(cm, np.ndarray):
+                    # Base mask tensor: multiply with coordinate mask
+                    chain_mask_arr *= cm.astype(np.float32)
+                elif isinstance(cm, torch.Tensor):
+                    chain_mask_arr *= cm.cpu().numpy().astype(np.float32)
+                else:
+                    # List of positions to zero out
+                    for p in cm:
+                        chain_mask_arr[p] = 0.0
+
+            mask_parts.append(chain_mask_arr)
+
+            chain_end = chain_start + padded_length
+            chain_encodings_parts.append(np.full(padded_length, c_id, dtype=np.int32))
+            residue_idx_parts.append(100 * c_id + np.arange(chain_start, chain_end, dtype=np.int32))
+            chain_start = chain_end
+
+        total_length = chain_start
+
+        # Build final arrays
+        if ca_only:
+            X = np.zeros([1, total_length, 1, 3])
+        else:
+            X = np.zeros([1, total_length, 4, 3])
+
+        X[0, :, :, :] = np.concatenate(X_chains, 0) #[L, n_atoms, 3]
+        mask = np.concatenate(mask_parts)[None, :] #[1, L]
+
         X = torch.from_numpy(X).to(dtype=torch.float32, device=device)
         mask = torch.from_numpy(mask).to(dtype=torch.float32, device=device)
-        
+
         all_seq = "".join(chain_seqs)
         S = np.asarray([Constants.ALPHABET.index(aa) for aa in all_seq], dtype=np.int32)
         S = torch.from_numpy(S).to(dtype=torch.long, device=device)
-        
+
+        chain_encodings = np.concatenate(chain_encodings_parts)[None, :]
+        residue_idx = np.concatenate(residue_idx_parts)[None, :]
         chain_encodings = torch.from_numpy(chain_encodings).to(dtype=torch.long, device=device)
         residue_idx = torch.from_numpy(residue_idx).to(dtype=torch.long, device=device)
-        
+
         if ca_only:
             X = X[:,:,0]
-        else:
-            X = X
         return X, S, mask, chain_encodings, residue_idx
     
     def _reset_decoding_order(self, decoding_order: torch.Tensor, keep_S: bool = True) -> None:
@@ -509,11 +575,16 @@ class WrapperProteinMPNN(BaseWrapper):
                 
         else:
             t = self.decoding_order[0, self.next_t_full] #Decoding position, relative to target protein
+            # Check force_stop before accessing decoding_order_target, since the
+            # stop position may not have an entry in decoding_order_target.
+            if self.config.force_stop and (t == self.end_pos):
+                logits = self._force_stop()
+                return logits, logits
             if not self.tied:
                 t_list = [ self.decoding_order_target[0, self.next_t] ]
             else:
                 t_list = self.decoding_order_target[0, (self.next_t*self.n_design_chains):((self.next_t+1)*self.n_design_chains)]
-        
+
         if self.config.force_stop and (t == self.end_pos):
             logits = self._force_stop()
             return logits, logits
