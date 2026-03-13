@@ -121,6 +121,88 @@ Load with `DesignConfig.from_yaml("my_design.yaml")`. Calling `DesignConfig.from
 
 Tensor fields (`logit_weight`, `logit_bias`, `aa_bias`, `max_aa_count`) can be specified in YAML as inline lists or paths to `.pt`/`.npy` files. They default to uniform/zero and are omitted from `base.yaml`.
 
+## Extended alphabets
+
+The OLG alphabet can be extended beyond the standard 20 amino acids + stop (`X`) to represent codon-level distinctions. A common case is splitting serine into two tokens based on which codons encode it, then restricting each frame to one group.
+
+```python
+from olg.constants import Constants, build_restricted_codon_table
+
+# --- Codon table: reassign specific codons to new tokens ---
+# AGT, AGC are taken from serine and reassigned to 'J'; TCN codons stay as 'S'.
+# Any number of new letters and codon sets can be specified simultaneously.
+codon_table = build_restricted_codon_table({"J": ["AGT", "AGC"]})
+
+# Extend the alphabet with the new token. Any ordering is valid;
+# indices are derived from letter identity, not position.
+alphabet = list(Constants.DEFAULT_ALPHABET) + ["J"]
+alphabet_index = {a: i for i, a in enumerate(alphabet)}
+
+# --- Per-frame exclusion via aa_bias ---
+# Setting aa_bias[idx] = MIN_LOGIT makes that token unsamplable in that frame.
+p1_aa_bias = torch.zeros(len(alphabet), device=device)
+p1_aa_bias[alphabet_index["S"]] = Constants.MIN_LOGIT   # frame 0: only J-serine (AGT/AGC)
+
+p2_aa_bias = torch.zeros(len(alphabet), device=device)
+p2_aa_bias[alphabet_index["J"]] = Constants.MIN_LOGIT   # frame 1: only S-serine (TCN)
+
+# --- Config ---
+config = DesignConfig(
+    codon_table=codon_table,
+    alphabet=alphabet,
+    protein1=ProteinConfig(length=100, aa_bias=p1_aa_bias, ...),
+    protein2=ProteinConfig(length=100, aa_bias=p2_aa_bias, force_start=True, ...),
+)
+olg = OLGDesign(config)
+
+# --- extra_aa_map: tell the model wrapper how to score extended tokens ---
+# ProteinMPNN has a fixed native vocabulary; map 'J' to native 'S' so it
+# scores restricted-serine positions with the same logits as regular serine.
+olg.initialize_decoder(
+    "ProteinMPNN", frame=0, model=mpnn_model,
+    ca_only=True, pdb_path="scaffold_1.pdb",
+    extra_aa_map={"J": "S"},
+)
+
+# --- Translating the result ---
+# Use translate_sequences() to recover S/J distinctions from the NT sequence.
+# This is independent of the model wrapper vocabulary and handles all arrangements.
+prot1, prot2 = olg.translate_sequences()
+```
+
+### Padding (extending proteins beyond PDB length)
+
+When a designed protein needs to be longer than the PDB scaffold, the ProteinMPNN wrapper can inject dummy residues with NaN coordinates at the N- and/or C-terminus via the `pad` parameter. These positions get `mask=0` automatically (no structural contribution from the model), while biases and codon constraints still apply.
+
+```python
+# 100-residue PDB, but we want a 102-AA protein (1 extra on each end)
+olg.initialize_decoder(
+    "ProteinMPNN", frame=1, model=model,
+    ca_only=True, pdb_path="scaffold.pdb",
+    pad=(1, 1),  # (n_terminal, c_terminal)
+)
+# ProteinConfig.length must include padding: length=102
+```
+
+`config.length` **includes** padding — padded positions are real design positions in the final protein. To control amino acid selection at padded positions (where the model contributes no information), use `logit_weight` and `logit_bias`:
+
+```python
+# Zero out model logits at extension positions, bias toward S and G
+logit_weight = torch.ones(length, device=device)
+logit_bias = torch.zeros((length, alphabet_size), device=device)
+
+for pos in extension_positions:
+    logit_weight[pos] = 0.0
+    logit_bias[pos, alphabet_index["S"]] = 1.0
+    logit_bias[pos, alphabet_index["G"]] = 1.0
+
+protein2 = ProteinConfig(
+    length=length, logit_weight=logit_weight, logit_bias=logit_bias, ...
+)
+```
+
+Padding is not supported with `tied=True` (complexes).
+
 ### Reading frame arrangements
 
 | Value | Name | Description |

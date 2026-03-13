@@ -35,20 +35,20 @@ class Constants:
     
     #Alphabets and quartets that we use
     NUCLEOTIDES = list('ATGC')
-    ALPHABET = list('ACDEFGHIKLMNPQRSTVWYX')
-    ALPHABET_SIZE = len(ALPHABET)
+    DEFAULT_ALPHABET = list('ACDEFGHIKLMNPQRSTVWYX')
+    DEFAULT_ALPHABET_SIZE = len(DEFAULT_ALPHABET)
     ALPHABET_GAP = list('ACDEFGHIKLMNPQRSTVWY-') #21 with gap
     NUCLEOTIDE_SIZE = len(NUCLEOTIDES)
-    
+
     QUARTETS = [ ''.join(p) for p in itertools.product(NUCLEOTIDES, repeat=4) ] #All possible combination of 4 nucleotides
     CODONS = [ ''.join(p) for p in itertools.product(NUCLEOTIDES, repeat=3) ] #All possible combination of 3 nucleotides
     QUARTET_SIZE = len(QUARTETS)
-    
-    ALPHABET_INDEX = { alphabet: index for index, alphabet in enumerate(ALPHABET) }
+
+    DEFAULT_ALPHABET_INDEX = { alphabet: index for index, alphabet in enumerate(DEFAULT_ALPHABET) }
     CODON_INDEX = { codon: index for index, codon in enumerate(CODONS) }
     NUCLEOTIDE_INDEX = { nucleotide: index for index, nucleotide in enumerate(NUCLEOTIDES) }
-    
-    STOP_INDEX = ALPHABET.index('X') #X will be used as stop codon 
+
+    STOP_INDEX = DEFAULT_ALPHABET.index('X') #X will be used as stop codon 
     GAP_TOKEN = 26 #As in EvoDiff alphabet
     GAP_TOKEN_GREMLIN = 20 #As in EvoDiff alphabet
     
@@ -179,3 +179,30 @@ class Constants:
     
     GREMLIN_ALPHABET_ = list("ARNDCQEGHILKMFPSTWYV-")
     GREMLIN_ALPHABET = dict(zip(GREMLIN_ALPHABET_, range(len(GREMLIN_ALPHABET_))))
+
+
+def build_restricted_codon_table(
+    restricted: dict[str, list[str]],
+    base_table: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build a codon table that reassigns specific codons to new tokens.
+
+    Takes any number of new amino acid letters and the codons that should
+    encode them, subtracting those codons from whatever amino acid they
+    currently encode in *base_table* and reassigning them to the new letter.
+    New letters must be added to the OLG alphabet explicitly.
+
+    Args:
+        restricted: Mapping of ``new_letter -> list of codons`` to reassign,
+            e.g. ``{"J": ["AGT", "AGC"]}`` reassigns AGT and AGC from serine
+            to 'J', or ``{"B": ["GAT", "GAC"], "Z": ["GAA", "GAG"]}`` to split
+            aspartate and glutamate into subgroups.
+        base_table: Starting codon table. Defaults to ``Constants.STANDARD_CODONS``.
+    """
+    if base_table is None:
+        base_table = Constants.STANDARD_CODONS
+    table = dict(base_table)
+    for new_letter, codons in restricted.items():
+        for codon in codons:
+            table[codon] = new_letter
+    return table

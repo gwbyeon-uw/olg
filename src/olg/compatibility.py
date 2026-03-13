@@ -16,15 +16,20 @@ class CodonCompatibility:
         config: DesignConfig
     ):
         self.config = config
+        self.alphabet = config.alphabet
+        self.alphabet_index = config.alphabet_index
+        self.stop_index = config.stop_index
         self.codon_table = self.config.codon_table
         if isinstance(self.codon_table, dict):
             pass  # already a dict, use as-is
         else:
-            self.codon_table = unambiguous_dna_by_name[self.codon_table].forward_table #From Biopython NCBI codes 
+            self.codon_table = unambiguous_dna_by_name[self.codon_table].forward_table #From Biopython NCBI codes
             for stop_codon in unambiguous_dna_by_name["Standard"].stop_codons:
                 self.codon_table[stop_codon] = "X"
         self.codon_table_rev = Constants._reverse_codon_table(self.codon_table)
-        self.codon_compatibility, self.quartets_aa = self.generate_compatibility_matrix(self.config.device, self.codon_table)
+        self.codon_compatibility, self.quartets_aa = self.generate_compatibility_matrix(
+            self.config.device, self.codon_table, self.alphabet, self.alphabet_index
+        )
         
         #First/last nucleotide for each of the 256 quartets
         self.prev_quartet_index = torch.tensor(Constants.PREV_QUARTET_INDEX).long()
@@ -52,19 +57,21 @@ class CodonCompatibility:
         self.codon_to_aa = torch.zeros((Constants.NUCLEOTIDE_SIZE, Constants.NUCLEOTIDE_SIZE, Constants.NUCLEOTIDE_SIZE), device=self.config.device).long()
         self.codon_to_aa_rc = torch.zeros((Constants.NUCLEOTIDE_SIZE, Constants.NUCLEOTIDE_SIZE, Constants.NUCLEOTIDE_SIZE), device=self.config.device).long()
         for i in range(Constants.NUCLEOTIDE_SIZE):
-            for j in  range(Constants.NUCLEOTIDE_SIZE):
-                for k in  range(Constants.NUCLEOTIDE_SIZE):
+            for j in range(Constants.NUCLEOTIDE_SIZE):
+                for k in range(Constants.NUCLEOTIDE_SIZE):
                     codon = Constants.NUCLEOTIDES[i] + Constants.NUCLEOTIDES[j] + Constants.NUCLEOTIDES[k]
                     codon_rc = Constants._reverse_complement(codon)
                     aa = self.codon_table[codon]
                     aa_rc = self.codon_table[codon_rc]
-                    self.codon_to_aa[i, j, k] = Constants.ALPHABET.index(aa)
-                    self.codon_to_aa_rc[i, j, k] = Constants.ALPHABET.index(aa_rc)
+                    self.codon_to_aa[i, j, k] = self.alphabet_index[aa]
+                    self.codon_to_aa_rc[i, j, k] = self.alphabet_index[aa_rc]
 
     @staticmethod
     def generate_compatibility_matrix(
         device: torch.device,
-        codon_table: Dict[str, str]
+        codon_table: Dict[str, str],
+        alphabet: List[str] = None,
+        alphabet_index: Dict[str, int] = None,
     ) -> Tuple[torch.Tensor, List[Tuple[int]]]:
         """
         Generate a compatibility matrix for codon pairings across multiple reading frames.
@@ -99,40 +106,46 @@ class CodonCompatibility:
               alt frame reverse complement aa, reference frame reverse complement aa)
         """
         
+        # Fall back to global constants for callers that don't supply alphabet
+        if alphabet is None:
+            alphabet = Constants.DEFAULT_ALPHABET
+        if alphabet_index is None:
+            alphabet_index = Constants.DEFAULT_ALPHABET_INDEX
+
         #Dim 0: first nucleotide (4); ATGC
         #Dim 1: last nucleotide (4)
         #Dim 2: arrangement
-        #Dim 3: amino acid 1 (21); 21st letter (X) is used as stop codon
-        #Dim 4: amino acid 2 (21)
+        #Dim 3: amino acid 1; len(alphabet) entries, last letter (X) is stop codon
+        #Dim 4: amino acid 2
         #Dim 5: quartet index (256)
-        codon_compatibility = torch.zeros((4, 4, 6, len(Constants.ALPHABET), len(Constants.ALPHABET), len(Constants.QUARTETS)), device=device, dtype=torch.int)
+        codon_compatibility = torch.zeros((4, 4, 6, len(alphabet), len(alphabet), len(Constants.QUARTETS)), device=device, dtype=torch.int)
         quartets_aa = [ None ] * len(Constants.QUARTETS) #Quartet index to amino acids in each alt frames
-        
+
         for q_i, q in enumerate(Constants.QUARTETS):
             q1 = Constants.NUCLEOTIDE_INDEX[q[0]]
             q4 = Constants.NUCLEOTIDE_INDEX[q[3]]
-    
+
             #reference frame
             q_ref = q[:3]
             aa_ref = codon_table[q_ref]
             aa_ref = 'X' if aa_ref == '*' else aa_ref
-            i_ref = Constants.ALPHABET_INDEX[aa_ref]
-    
+            i_ref = alphabet_index[aa_ref]
+
             #shifted
             q_alt = q[1:]
             aa_alt = codon_table[q_alt]
             aa_alt = 'X' if aa_alt == '*' else aa_alt
-            i_alt = Constants.ALPHABET_INDEX[aa_alt]
-    
+            i_alt = alphabet_index[aa_alt]
+
             #reverse complement of shifted
             aa_alt_neg = codon_table[Constants._reverse_complement(q_alt)]
             aa_alt_neg = 'X' if aa_alt_neg == '*' else aa_alt_neg
-            i_alt_neg = Constants.ALPHABET_INDEX[aa_alt_neg]
-    
+            i_alt_neg = alphabet_index[aa_alt_neg]
+
             #reverse complement of reference
             aa_neg = codon_table[Constants._reverse_complement(q_ref)]
             aa_neg = 'X' if aa_neg == '*' else aa_neg
-            i_neg = Constants.ALPHABET_INDEX[aa_neg]
+            i_neg = alphabet_index[aa_neg]
             
             codon_compatibility[q1, q4, 0, i_ref, i_alt, q_i] = 1
             codon_compatibility[q1, q4, 1, i_ref, i_alt_neg, q_i] = 1

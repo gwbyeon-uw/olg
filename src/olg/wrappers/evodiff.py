@@ -15,6 +15,9 @@ from evodiff.pretrained import MSA_OA_DM_MAXSUB, ESM_MSA_1b #https://github.com/
 from .base_wrapper import BaseWrapper
 
 class WrapperEvoDiff(BaseWrapper):
+    # 'X' (stop codon) maps to '-' (gap token) in EvoDiff vocabulary
+    _DEFAULT_EXTRA_AA_MAP: dict[str, str] = {'X': '-'}
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -23,8 +26,9 @@ class WrapperEvoDiff(BaseWrapper):
         msa_n_seq: int,
         msa_max_length: int,
         msa_selection_type: Literal['random', 'MaxHamming', 'MaxHammingI'] = 'random',
-        use_esm_msa: bool = False,        
+        use_esm_msa: bool = False,
         prefixed_seq: Optional[Tuple[int, int, str]] = None,
+        extra_aa_map: Optional[dict[str, str]] = None,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -33,8 +37,9 @@ class WrapperEvoDiff(BaseWrapper):
         self.model = model
         self.tokenizer = tokenizer
         self.vocab_size = len(self.tokenizer.alphabet)
-    
-        #MSA subsampling        
+        self._build_alphabet_maps(self.tokenizer.a_to_i, extra_aa_map, self._DEFAULT_EXTRA_AA_MAP)
+
+        #MSA subsampling
         self.msa_seqs = msa_seqs
         self.msa_n_seq = msa_n_seq # number of sequences in MSA to subsample
         self.msa_max_length = msa_max_length # maximum sequence length to subsample
@@ -50,9 +55,6 @@ class WrapperEvoDiff(BaseWrapper):
         self.valid_msa = torch.tensor(np.array([self.tokenizer.tokenizeMSA(seq) for seq in self.valid_msa_]), device=self.device) #Tokenize sequence
         self.padding = torch.full((self.msa_n_seq, self.msa_max_length-self.seq_len), fill_value=self.tokenizer.pad_id, device=self.device)
         
-        self.alphabet_map = torch.tensor([ self.tokenizer.a_to_i[l] for l in Constants.ALPHABET_GAP ], device=self.device) #Index we use to EvoDiff index
-        self.alphabet_map_rev = torch.tensor([ Constants.ALPHABET_GAP.index(a) if a in Constants.ALPHABET_GAP else -1 for a in self.tokenizer.alphabet  ], device=self.device) #EvoDiff index to index we use
-
         self.prefixed_seq = prefixed_seq #List of tuples, (start, end, seq)
         
         self.remap_to_evodiff = Constants.REMAP_TO_EVODIFF.to(self.device)
@@ -71,8 +73,8 @@ class WrapperEvoDiff(BaseWrapper):
         tmp = torch.zeros(self.seq_len, device=self.device) - 1 #Position relative to target protein
         if self.config.fixed_positions is not None:
             for pos, aa in self.config.fixed_positions:
-                tmp[pos-1] = Constants.ALPHABET.index(aa)
-        self.fixed_positions = tmp.long() #This will have -1 non-fixed positions and AA index at fixed positions    
+                tmp[pos-1] = self.alphabet_index[aa]
+        self.fixed_positions = tmp.long() #This will have -1 non-fixed positions and OLG-internal AA index at fixed positions
         
         self.reset(self.decoding_order, self.rand_base)
 
@@ -287,13 +289,13 @@ class WrapperEvoDiff(BaseWrapper):
     
             if dummy_run:
                 logits_ = self.current_logits.clone()[:, self.alphabet_map] #Only the alphabet we use
-                logits_[:, Constants.STOP_INDEX] = Constants.MIN_LOGIT #Zero out the index for X
-                logits = logits_.clone() 
+                logits_[:, self.stop_index] = Constants.MIN_LOGIT #Zero out the index for X
+                logits = logits_.clone()
             else:
                 logits_ = self.current_logits.clone() #Only first row and standard AAs
                 logits_ -= logits_.mean() #Center it
                 logits_ = logits_[:, self.alphabet_map] #Only the alphabet we use
-                logits_[:, Constants.STOP_INDEX] = Constants.MIN_LOGIT #Zero out the index for X
+                logits_[:, self.stop_index] = Constants.MIN_LOGIT #Zero out the index for X
 
                 logits = logits_.clone()
                 logits = self._apply_constraints(logits, t)
@@ -353,7 +355,8 @@ class WrapperEvoDiff(BaseWrapper):
     def preset_fixed_S(self, fixed_start, fixed_end, fixed_seq):
         t = torch.arange(fixed_start, fixed_end + 1, device=self.device)
         t_msa = self.gap_map[t] #Decoding position, relative to the MSA of the target protein
-        fixed_token = self.alphabet_map[torch.tensor([ Constants.ALPHABET_GAP.index(c) for c in fixed_seq ], device=self.device)]
+        # Convert fixed_seq chars directly to EvoDiff native tokens (may include '-' for gaps)
+        fixed_token = torch.tensor([ self.tokenizer.a_to_i.get(c, self.tokenizer.a_to_i['-']) for c in fixed_seq ], device=self.device)
         self.edit_S(t_msa, fixed_token, inplace=True) #t here not relative to MSA
         self.decoded_positions[:, t_msa] = 1.0
     
@@ -370,7 +373,7 @@ class WrapperEvoDiff(BaseWrapper):
     def get_prot_seq(self, S=None):
         if S is None:
             S = self.alphabet_map_rev[self.S[0, self.config.start_offset:self.seq_len]]
-        prot = ''.join([Constants.ALPHABET_GAP[s] for s in S])
+        prot = ''.join([self.alphabet[s.item()] for s in S])
         return prot
 
     #Decodes all; this is used to design non-overlapping proteins with the same parameters

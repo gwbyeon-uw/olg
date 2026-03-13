@@ -21,7 +21,8 @@ class BaseWrapper:
         config: ProteinConfig,
         decoding_order: torch.Tensor,
         rand_base: float,
-        tqdm_disable: bool
+        tqdm_disable: bool,
+        alphabet: list[str] | None = None,
     ):
         self.device = device
         self.config = config
@@ -29,8 +30,22 @@ class BaseWrapper:
         self.rand_base = rand_base
         self.tqdm_disable = tqdm_disable
 
+        if alphabet is None:
+            alphabet = list(Constants.DEFAULT_ALPHABET)
+        self.alphabet = alphabet
+        self.alphabet_size = len(alphabet)
+        self.alphabet_index = {a: i for i, a in enumerate(alphabet)}
+        if 'X' not in self.alphabet_index:
+            raise ValueError("alphabet must contain 'X' (stop codon marker)")
+        self.stop_index = self.alphabet_index['X']
+
+        # Precompute positively charged AA indices for max_pos_count constraint
+        self.pos_charged_indices = [
+            self.alphabet_index[aa] for aa in ('H', 'K', 'R') if aa in self.alphabet_index
+        ]
+
         self.logit_weight = self.config.logit_weight.clone()
-        
+
         self.alphabet_inds = torch.arange(20, device=self.device) # Dummy
         
     #Top p thresholding given logit vector
@@ -66,6 +81,50 @@ class BaseWrapper:
         noised_tensor = tensor + torch.rand(tensor.shape, device=tensor.device) * factor
         return noised_tensor
 
+    def _build_alphabet_maps(
+        self,
+        model_native_vocab: dict[str, int],
+        extra_aa_map: dict[str, str] | None,
+        default_extra_aa_map: dict[str, str],
+    ) -> None:
+        """Build alphabet_map and alphabet_map_rev tensors.
+
+        alphabet_map[i]     = model token index for OLG internal index i
+        alphabet_map_rev[j] = OLG internal index for model token j (-1 if unmapped)
+
+        Args:
+            model_native_vocab: char -> token index for the model's fixed training vocab
+            extra_aa_map: per-call override mapping (OLG letter -> native vocab char),
+                or None to fall back to default_extra_aa_map
+            default_extra_aa_map: class-level fallback mapping (e.g. 'X' -> '-' for gap models)
+        """
+        effective_map = extra_aa_map if extra_aa_map is not None else default_extra_aa_map
+        alphabet_map_list = []
+        for letter in self.alphabet:
+            if letter in effective_map:
+                native_char = effective_map[letter]
+                if native_char not in model_native_vocab:
+                    raise ValueError(
+                        f"extra_aa_map maps '{letter}' -> '{native_char}', "
+                        f"but '{native_char}' is not in the model's native vocabulary."
+                    )
+                alphabet_map_list.append(model_native_vocab[native_char])
+            elif letter in model_native_vocab:
+                alphabet_map_list.append(model_native_vocab[letter])
+            else:
+                raise ValueError(
+                    f"Alphabet letter '{letter}' has no mapping to the model's native vocabulary. "
+                    f"Add it to extra_aa_map or extend the model's vocabulary."
+                )
+        self.alphabet_map = torch.tensor(alphabet_map_list, dtype=torch.long, device=self.device)
+
+        vocab_size = max(model_native_vocab.values()) + 1
+        alphabet_map_rev = torch.full((vocab_size,), -1, dtype=torch.long, device=self.device)
+        for native_char, token_idx in model_native_vocab.items():
+            if native_char in self.alphabet_index:
+                alphabet_map_rev[token_idx] = self.alphabet_index[native_char]
+        self.alphabet_map_rev = alphabet_map_rev
+
     def _apply_repetition_penalty(
         self,
         logits: torch.Tensor, 
@@ -89,26 +148,31 @@ class BaseWrapper:
         return logits_new
 
     def _apply_weights_and_biases(
-        self, 
-        logits: torch.Tensor, 
+        self,
+        logits: torch.Tensor,
         t: int
     ) -> torch.Tensor:
-        """Apply position-specific weights and biases."""
-        return self.logit_weight[t] * (logits + self.config.aa_bias.unsqueeze(0) + self.config.logit_bias[t:(t + 1), :])
+        """Apply position-specific weights and biases.
+
+        Weight scales only the model logits; biases are added after so that
+        user constraints (aa_bias, logit_bias) remain effective even when
+        logit_weight is 0 (e.g. at padded positions).
+        """
+        return self.logit_weight[t] * logits + self.config.aa_bias.unsqueeze(0) + self.config.logit_bias[t:(t + 1), :]
 
     def _force_stop(self) -> torch.Tensor:
-        logits = torch.zeros(Constants.ALPHABET_SIZE, device=self.device).unsqueeze(0)
-        logits[0, Constants.STOP_INDEX] = Constants.MAX_LOGIT #High number to force stop
+        logits = torch.zeros(self.alphabet_size, device=self.device).unsqueeze(0)
+        logits[0, self.stop_index] = Constants.MAX_LOGIT #High number to force stop
         logits = BaseWrapper._add_noise(logits)
         return logits
 
     def _penalize_stop(self, logits: torch.Tensor) -> torch.Tensor:
         logits_new = logits.clone()
-        logits_new[0, Constants.STOP_INDEX] = Constants.MIN_LOGIT
+        logits_new[0, self.stop_index] = Constants.MIN_LOGIT
         return logits_new
 
     def _force_fixed_positions(self, logits: torch.Tensor, t: int) -> torch.Tensor:
-        logits = torch.zeros(Constants.ALPHABET_SIZE, device=self.device).unsqueeze(0)
+        logits = torch.zeros(self.alphabet_size, device=self.device).unsqueeze(0)
         logits[0, self.fixed_positions[t]] = Constants.MAX_LOGIT #High number to force fixed residue
         return logits
 
@@ -126,10 +190,11 @@ class BaseWrapper:
         ).sum(1)[:, self.alphabet_map]
         logits[aa_count >= self.config.max_aa_count] = Constants.MIN_LOGIT
 
-        if (aa_count[0, 6] + aa_count[0, 8] + aa_count[0, 14]) >= self.config.max_pos_count:
-            logits[0, 6] = Constants.MIN_LOGIT
-            logits[0, 8] = Constants.MIN_LOGIT
-            logits[0, 14] = Constants.MIN_LOGIT
+        if self.pos_charged_indices and (
+            sum(aa_count[0, i] for i in self.pos_charged_indices) >= self.config.max_pos_count
+        ):
+            for i in self.pos_charged_indices:
+                logits[0, i] = Constants.MIN_LOGIT
 
         logits = BaseWrapper._top_p(logits, self.config.truncate_topp)
         return logits
@@ -249,13 +314,13 @@ class ZeroOrderWrapper(BaseWrapper):
         self.logits = model
         self.vocab_size = self.logits.shape[1]
 
-        self.alphabet_map = torch.arange(Constants.ALPHABET_SIZE, device=self.device) #Dummy
-        self.alphabet_map_rev = torch.arange(Constants.ALPHABET_SIZE, device=self.device) #Dummy
+        self.alphabet_map = torch.arange(self.alphabet_size, device=self.device) #Dummy
+        self.alphabet_map_rev = torch.arange(self.alphabet_size, device=self.device) #Dummy
 
         tmp = torch.zeros(self.config.length, device=self.device) - 1 #Position relative to target protein
         if self.config.fixed_positions is not None:
             for pos, aa in self.config.fixed_positions:
-                tmp[pos-1] = Constants.ALPHABET.index(aa)
+                tmp[pos-1] = self.alphabet_index[aa]
         self.fixed_positions = tmp.long() #This will have -1 non-fixed positions and AA index at fixed positions    
         
         self.reset(self.decoding_order, self.rand_base)   
@@ -324,7 +389,7 @@ class ZeroOrderWrapper(BaseWrapper):
             else:
                 logits_ = self.current_logits.clone()[:, self.alphabet_map]
                 logits_ -= logits_.mean()
-                logits_[:, Constants.STOP_INDEX] = Constants.MIN_LOGIT
+                logits_[:, self.stop_index] = Constants.MIN_LOGIT
                 logits = logits_.clone()
                 logits = self._apply_constraints(logits, t)
 
@@ -386,7 +451,7 @@ class ZeroOrderWrapper(BaseWrapper):
     def get_prot_seq(self, S=None):
         if S is None:
             S = self.alphabet_map_rev[self.S[0, self.config.start_offset:self.config.length]]
-        prot = ''.join([Constants.ALPHABET[s] for s in S])
+        prot = ''.join([self.alphabet[s] for s in S])
         return prot
 
     def get_tied_positions(self) -> list[int]:

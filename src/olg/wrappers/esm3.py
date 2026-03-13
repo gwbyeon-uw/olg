@@ -12,10 +12,14 @@ from olg.config import ProteinConfig
 from .base_wrapper import BaseWrapper
 
 class WrapperESM3(BaseWrapper):
+    # No default remapping: standard OLG letters (including 'X') are in ESM3's tokenizer
+    _DEFAULT_EXTRA_AA_MAP: dict[str, str] = {}
+
     def __init__(
         self,
-        model: nn.Module, 
+        model: nn.Module,
         prefixed_seq: Optional[Tuple[int, int, str]] = None,
+        extra_aa_map: Optional[dict[str, str]] = None,
         **kwargs
     ):
         """
@@ -28,21 +32,16 @@ class WrapperESM3(BaseWrapper):
         self.cls_idx = self.tokenizer['<cls>']
         self.eos_idx = self.tokenizer['<eos>']
         self.vocab_size = len(self.tokenizer)
-        self.alphabet_map = torch.tensor([ self.tokenizer[l] for l in Constants.ALPHABET ], device=self.device) #Index we use to ESM3 index
-        self.alphabet_map_rev = torch.arange(self.vocab_size, device=self.device)
-        self.alphabet_map_rev.fill_(-1)
-        for a, i in self.tokenizer.items():
-            if a in Constants.ALPHABET:
-                self.alphabet_map_rev[i] = Constants.ALPHABET.index(a)
-        
+        self._build_alphabet_maps(self.tokenizer, extra_aa_map, self._DEFAULT_EXTRA_AA_MAP)
+
         self.L = self.config.length + 2
         self.prefixed_seq = prefixed_seq #List of tuples, (start, end, seq)
-            
+
         tmp = torch.zeros(self.config.length, device=self.device) - 1 #Position relative to target protein
         if self.config.fixed_positions is not None:
             for pos, aa in self.config.fixed_positions:
-                tmp[pos-1] = Constants.ALPHABET.index(aa)
-        self.fixed_positions = tmp.long() #This will have -1 non-fixed positions and AA index at fixed positions    
+                tmp[pos-1] = self.alphabet_index[aa]
+        self.fixed_positions = tmp.long() #This will have -1 non-fixed positions and OLG-internal AA index at fixed positions
         
         self.reset(self.decoding_order, self.rand_base)    
 
@@ -148,7 +147,7 @@ class WrapperESM3(BaseWrapper):
             else:
                 logits_ = self.current_logits.clone()[:, self.alphabet_map]
                 logits_ -= logits_.mean()
-                logits_[:, Constants.STOP_INDEX] = Constants.MIN_LOGIT
+                logits_[:, self.stop_index] = Constants.MIN_LOGIT
                 logits = logits_.clone()
                 logits = self._apply_constraints(logits, t)
 
@@ -200,7 +199,7 @@ class WrapperESM3(BaseWrapper):
     #Update protein sequence vector S for fixing some regions that will not be part of OLG decoding
     def preset_fixed_S(self, fixed_start, fixed_end, fixed_seq):
         t = torch.arange(fixed_start, fixed_end + 1, device=self.device)
-        fixed_token = self.alphabet_map[torch.tensor([ Constants.ALPHABET.index(c) for c in fixed_seq ], device=self.device)]
+        fixed_token = self.alphabet_map[torch.tensor([ self.alphabet_index[c] for c in fixed_seq ], device=self.device)]
         self.edit_S(t, fixed_token, inplace=True) #t here not relative to MSA
         self.decoded_positions[:, t] = 1.0
     
@@ -217,7 +216,7 @@ class WrapperESM3(BaseWrapper):
     def get_prot_seq(self, S=None):
         if S is None:
             S = self.alphabet_map_rev[self.S[0, self.config.start_offset:self.config.length]]
-        prot = ''.join([Constants.ALPHABET[s] for s in S])
+        prot = ''.join([self.alphabet[s.item()] for s in S])
         return prot
 
     #Decodes all; this is used to design non-overlapping proteins with the same parameters

@@ -12,6 +12,13 @@ from ._vendored.protein_mpnn_utils import gather_nodes, cat_neighbors_nodes, _sc
 from .base_wrapper import BaseWrapper
 
 class WrapperProteinMPNN(BaseWrapper):
+    # ProteinMPNN's fixed training vocabulary (21 tokens, identical ordering to Constants.DEFAULT_ALPHABET)
+    _NATIVE_LETTERS: str = 'ACDEFGHIKLMNPQRSTVWYX'
+    _NATIVE_VOCAB: dict[str, int] = {c: i for i, c in enumerate('ACDEFGHIKLMNPQRSTVWYX')}
+    _NATIVE_VOCAB_SIZE: int = 21
+    # No default remapping needed: standard OLG alphabet == ProteinMPNN native vocab
+    _DEFAULT_EXTRA_AA_MAP: dict[str, str] = {}
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -23,8 +30,9 @@ class WrapperProteinMPNN(BaseWrapper):
         tied: bool = False,
         tied_weight: Optional[List[Tuple[str, float]]] = [],
         fixed_chain_seq: Optional[List[Tuple[str]]] = [],
-        pad: Optional[List[List[int]]] = None,
         chain_mask: Optional[List] = None,
+        extra_aa_map: Optional[Dict[str, str]] = None,
+        pad: Tuple[int, int] = (0, 0),
         **kwargs
     ):
         """
@@ -40,28 +48,29 @@ class WrapperProteinMPNN(BaseWrapper):
             tied: Whether to use tied decoding for symmetric design
             tied_weight: Weights for tied positions (chain_letter, weight)
             fixed_chain_seq: List of (chain_letter, sequence) for fixed chains
-            pad: Per-chain padding as [[pad_left, pad_right], ...], one entry per
-                chain in all_chains order. Padded positions get zero coordinates
-                and mask=0. None means no padding.
             chain_mask: Per-chain masks, one entry per chain in all_chains order.
                 Each entry can be: None (no masking), a list of int positions
                 within that chain to force mask=0, or an array/tensor of shape
                 [chain_length] used as the base mask (1=valid, 0=masked).
+            pad: (pad_n, pad_c) number of dummy Gly residues to prepend/append
+                to the target (first design) chain.  Padded positions get NaN
+                coordinates and mask=0 so ProteinMPNN ignores them structurally,
+                but they are real design positions included in config.length.
         """
         super().__init__(**kwargs)
 
         self.ca_only = ca_only
         self.model = model
+        self._build_alphabet_maps(self._NATIVE_VOCAB, extra_aa_map, self._DEFAULT_EXTRA_AA_MAP)
         self._set_target_from_pdb(pdb_path, fixed_chains, design_chains, undecoded_chains,
-                                  tied, tied_weight, fixed_chain_seq, pad=pad, chain_mask=chain_mask)
-
-        self.alphabet_map = torch.arange(Constants.ALPHABET_SIZE, device=self.device) #Dummy
-        self.alphabet_map_rev = torch.arange(Constants.ALPHABET_SIZE, device=self.device) #Dummy
+                                  tied, tied_weight, fixed_chain_seq, chain_mask=chain_mask,
+                                  pad=pad)
 
         self.reset(self.decoding_order, self.rand_base)
 
     def _set_target_from_pdb(self, pdb_path, fixed_chains=[], design_chains=["A"], undecoded_chains=[], tied=False, tied_weight=[], fixed_chain_seq=[],
-                             pad=None, chain_mask=None):
+                             chain_mask=None, pad=(0, 0)):
+        self.pad_n, self.pad_c = pad
         self.pdb_data, self.chain_id = self._process_pdb(pdb_path, self.ca_only, fixed_chains, design_chains, undecoded_chains)
         self.fixed_chains, self.design_chains, self.undecoded_chains, self.all_chains = self.chain_id
         self.fixed_chain_seq = fixed_chain_seq #list of tuples (chain_letter, seq)
@@ -70,8 +79,17 @@ class WrapperProteinMPNN(BaseWrapper):
         self.n_fixed_chains = len(self.fixed_chains)
         self.n_undecoded_chains = len(self.undecoded_chains) #Chains to be left undecoded; useful for pairing with a residue in the other frame's container instance for hetero-multimer design
 
+        # Inject padding into pdb_data before featurization
+        if self.pad_n > 0 or self.pad_c > 0:
+            if tied:
+                raise ValueError("pad != (0,0) is not supported with tied=True")
+            target_chain = self.design_chains[0]
+            self._pad_chain(self.pdb_data, target_chain, self.pad_n, self.pad_c, self.ca_only)
+            target_chain_idx = self.all_chains.index(target_chain)
+            chain_mask = self._adjust_chain_mask(chain_mask, target_chain_idx, self.pad_n, self.pad_c)
+
         self.X, self.S_orig, self.mask, self.chain_encoding, self.residue_idx = self._featurize(
-            self.device, self.pdb_data, self.chain_id, self.ca_only, pad=pad, chain_mask=chain_mask
+            self.device, self.pdb_data, self.chain_id, self.ca_only, chain_mask=chain_mask
         ) # Featurize structure
         self.target_chain = self.design_chains[0] #There can be multiple design chains for tied option, but only first one will be the "main" chain
         self.chain_lengths = [ (self.chain_encoding[0, :] == self.all_chains.index(chain_letter)).sum() for chain_letter in self.all_chains ]
@@ -83,8 +101,8 @@ class WrapperProteinMPNN(BaseWrapper):
         tmp = torch.zeros(self.target_chain_length, device=self.device) - 1 #Position relative to target protein
         if self.config.fixed_positions is not None:
             for pos, aa in self.config.fixed_positions:
-                tmp[pos-1] = Constants.ALPHABET.index(aa)
-        self.fixed_positions = tmp.long() #This will have -1 non-fixed positions and AA index at fixed positions
+                tmp[pos-1] = self.alphabet_index[aa]
+        self.fixed_positions = tmp.long() #This will have -1 non-fixed positions and OLG-internal AA index at fixed positions
         
         self.tied = tied
         
@@ -105,7 +123,7 @@ class WrapperProteinMPNN(BaseWrapper):
         num_layers = 3
         backbone_noise = 0.00 #Noise is 0 during inference
         checkpoint = torch.load(checkpoint_path, map_location=device) 
-        model = ProteinMPNN(ca_only=ca_only, num_letters=len(Constants.ALPHABET), 
+        model = ProteinMPNN(ca_only=ca_only, num_letters=WrapperProteinMPNN._NATIVE_VOCAB_SIZE,
                             node_features=hidden_dim, edge_features=hidden_dim, 
                             hidden_dim=hidden_dim, num_encoder_layers=num_layers,
                             num_decoder_layers=num_layers, augment_eps=backbone_noise, 
@@ -160,7 +178,89 @@ class WrapperProteinMPNN(BaseWrapper):
             design_chain_list = [ letter for letter in all_chain_list if letter in design_chains ]
             
         chain_id = (fixed_chain_list, design_chain_list, undecoded_chain_list, all_chain_list)
-        return pdb_data, chain_id 
+        return pdb_data, chain_id
+
+    @staticmethod
+    def _pad_chain(
+        pdb_data: Dict[str, Any],
+        chain_letter: str,
+        pad_n: int,
+        pad_c: int,
+        ca_only: bool,
+    ) -> None:
+        """Mutate pdb_data to prepend/append dummy Gly residues with NaN coords.
+
+        NaN coordinates cause _featurize to set mask=0 for padded positions
+        automatically via its np.isfinite check, so no _featurize changes are
+        needed.
+
+        Args:
+            pdb_data: Parsed PDB dict (modified in place).
+            chain_letter: Which chain to pad (e.g. "A").
+            pad_n: Number of Gly residues to prepend (N-terminal).
+            pad_c: Number of Gly residues to append (C-terminal).
+            ca_only: Whether only CA atoms are present.
+        """
+        seq_key = f"seq_chain_{chain_letter}"
+        pdb_data[seq_key] = "G" * pad_n + pdb_data[seq_key] + "G" * pad_c
+
+        nan3 = [float("nan")] * 3
+        coords_dict = pdb_data[f"coords_chain_{chain_letter}"]
+        if ca_only:
+            # CA coords in ca_only mode are [L, 1, 3] (triply nested lists)
+            nan_n = [[nan3] for _ in range(pad_n)]
+            nan_c = [[nan3] for _ in range(pad_c)]
+            key = f"CA_chain_{chain_letter}"
+            coords_dict[key] = nan_n + coords_dict[key] + nan_c
+        else:
+            # N/CA/C/O coords are [L, 3] (doubly nested lists)
+            nan_n = [nan3 for _ in range(pad_n)]
+            nan_c = [nan3 for _ in range(pad_c)]
+            for atom in ["N", "CA", "C", "O"]:
+                key = f"{atom}_chain_{chain_letter}"
+                coords_dict[key] = nan_n + coords_dict[key] + nan_c
+
+    @staticmethod
+    def _adjust_chain_mask(
+        chain_mask: Optional[List],
+        target_chain_idx: int,
+        pad_n: int,
+        pad_c: int,
+    ) -> Optional[List]:
+        """Expand a user-provided chain_mask entry to account for padding.
+
+        Args:
+            chain_mask: Per-chain mask list (may be None).
+            target_chain_idx: Index of the padded chain in all_chains.
+            pad_n: N-terminal padding count.
+            pad_c: C-terminal padding count.
+
+        Returns:
+            The (possibly modified) chain_mask list, or None.
+        """
+        if chain_mask is None:
+            return None
+        if target_chain_idx >= len(chain_mask):
+            return chain_mask
+        cm = chain_mask[target_chain_idx]
+        if cm is None:
+            return chain_mask
+
+        chain_mask = list(chain_mask)  # shallow copy so caller's list is not mutated
+        if isinstance(cm, np.ndarray):
+            chain_mask[target_chain_idx] = np.concatenate(
+                [np.zeros(pad_n, dtype=cm.dtype), cm, np.zeros(pad_c, dtype=cm.dtype)]
+            )
+        elif isinstance(cm, torch.Tensor):
+            chain_mask[target_chain_idx] = torch.cat([
+                torch.zeros(pad_n, dtype=cm.dtype, device=cm.device),
+                cm,
+                torch.zeros(pad_c, dtype=cm.dtype, device=cm.device),
+            ])
+        else:
+            # list of int positions to zero out — shift by pad_n
+            chain_mask[target_chain_idx] = [p + pad_n for p in cm]
+        return chain_mask
 
     @staticmethod
     def _featurize(
@@ -168,15 +268,12 @@ class WrapperProteinMPNN(BaseWrapper):
         pdb: Dict[str, Any],
         chain_id: Tuple[List[str], List[str], List[str], List[str]],
         ca_only: bool = False,
-        pad: Optional[List[List[int]]] = None,
         chain_mask: Optional[List] = None,
     ) -> Tuple[torch.Tensor]:
         """
         Featurize protein structure data. Simpler rewrite of tied_featurize from ProteinMPNN.
         Orders and concatenates coordinates (X) and sequences (S) across chains.
         Also returns position encoded residue index, mask and chain encoding.
-
-        Supports per-chain padding with dummy residues and per-chain masking.
 
         Args:
             device: torch.device
@@ -187,9 +284,6 @@ class WrapperProteinMPNN(BaseWrapper):
             chain_id: Tuple of (fixed_chains, design_chains, undecoded_chains, all_chains)
                 where each element is a list of chain letters
             ca_only: If True, only use CA (alpha carbon) coordinates
-            pad: Per-chain padding as [[pad_left, pad_right], ...], one entry per
-                chain in all_chains order. Padded positions get zero coordinates
-                and mask=0. None means no padding for any chain.
             chain_mask: Per-chain masks, one entry per chain in all_chains order.
                 Each entry can be:
                 - None: no additional masking for this chain
@@ -229,32 +323,12 @@ class WrapperProteinMPNN(BaseWrapper):
             else:
                 X_chain = np.stack([chain_coords[c] for c in ["N_chain_"+chain_letter, "CA_chain_"+chain_letter, "C_chain_"+chain_letter, "O_chain_"+chain_letter]], 1) #[chain_length,4,3]
 
-            # Per-chain padding
-            pad_n = pad[c_id][0] if (pad is not None and c_id < len(pad)) else 0
-            pad_c = pad[c_id][1] if (pad is not None and c_id < len(pad)) else 0
-
-            if pad_n > 0:
-                X_chain = np.concatenate([np.zeros([pad_n, n_atoms, 3]), X_chain], axis=0)
-                chain_seq = "G" * pad_n + chain_seq
-
-            if pad_c > 0:
-                X_chain = np.concatenate([X_chain, np.zeros([pad_c, n_atoms, 3])], axis=0)
-                chain_seq = chain_seq + "G" * pad_c
-
-            padded_length = chain_length + pad_n + pad_c
-
             X_chains.append(X_chain)
             chain_seqs.append(chain_seq)
 
-            # Build per-chain mask: start from coordinate validity, then apply padding and user mask
-            chain_mask_arr = np.isfinite(np.sum(X_chain, (1, 2))).astype(np.float32) # [padded_length]
+            # Build per-chain mask: start from coordinate validity, then apply user mask
+            chain_mask_arr = np.isfinite(np.sum(X_chain, (1, 2))).astype(np.float32) # [chain_length]
             X_chain[np.isnan(X_chain)] = 0. # Replace NaN with 0 after mask computation
-
-            # Padded positions always get mask=0
-            if pad_n > 0:
-                chain_mask_arr[:pad_n] = 0.0
-            if pad_c > 0:
-                chain_mask_arr[-pad_c:] = 0.0
 
             # Apply per-chain user mask
             if chain_mask is not None and c_id < len(chain_mask) and chain_mask[c_id] is not None:
@@ -271,8 +345,8 @@ class WrapperProteinMPNN(BaseWrapper):
 
             mask_parts.append(chain_mask_arr)
 
-            chain_end = chain_start + padded_length
-            chain_encodings_parts.append(np.full(padded_length, c_id, dtype=np.int32))
+            chain_end = chain_start + chain_length
+            chain_encodings_parts.append(np.full(chain_length, c_id, dtype=np.int32))
             residue_idx_parts.append(100 * c_id + np.arange(chain_start, chain_end, dtype=np.int32))
             chain_start = chain_end
 
@@ -291,7 +365,8 @@ class WrapperProteinMPNN(BaseWrapper):
         mask = torch.from_numpy(mask).to(dtype=torch.float32, device=device)
 
         all_seq = "".join(chain_seqs)
-        S = np.asarray([Constants.ALPHABET.index(aa) for aa in all_seq], dtype=np.int32)
+        _nv = WrapperProteinMPNN._NATIVE_VOCAB
+        S = np.asarray([_nv.get(aa, _nv['X']) for aa in all_seq], dtype=np.int32)
         S = torch.from_numpy(S).to(dtype=torch.long, device=device)
 
         chain_encodings = np.concatenate(chain_encodings_parts)[None, :]
@@ -341,6 +416,15 @@ class WrapperProteinMPNN(BaseWrapper):
         else:
             self.decoding_order_S = self.decoding_order_target_und
 
+        # _get_decoding_mask requires a complete permutation of all model positions.
+        # Prepend any uncovered positions — they are masked out so their ordering is irrelevant.
+        model_size = self.X.shape[1]
+        covered = self.decoding_order_S[0]
+        all_pos = torch.arange(model_size, device=self.device)
+        uncovered = all_pos[~torch.isin(all_pos, covered)]
+        if uncovered.numel() > 0:
+            self.decoding_order_S = torch.cat([uncovered.unsqueeze(0), self.decoding_order_S], dim=1)
+
         #Prepare encoder
         if keep_S:
             _, _, self.E_idx, self.h_E, self.h_EXV_encoder_fw, self.h_V_stack, self.mask_bw, self.h_EXV_encoder = self._prepare_encoder(self.decoding_order_S) #Initially, S and h_S are empty
@@ -379,7 +463,7 @@ class WrapperProteinMPNN(BaseWrapper):
         self.decoded_positions = torch.zeros(self.decoding_order_S.shape, device=self.device) #This will track decoded positions during design iterations
         self.selected_aa = torch.zeros(self.decoding_order_target.shape[1], device=self.device).unsqueeze(0).long() #This will keep track of AAs decoded at each position
         self.selected_log_prob = torch.zeros(self.decoding_order_target.shape[1], device=self.device).unsqueeze(0) #This will keep track of log probs for selected AA
-        self.log_prob = torch.zeros((self.decoding_order_target.shape[1], Constants.ALPHABET_SIZE), device=self.device) #This will keep track of log probs at each step
+        self.log_prob = torch.zeros((self.decoding_order_target.shape[1], self._NATIVE_VOCAB_SIZE), device=self.device) #This will keep track of log probs at each step (native space)
         self.argmax_aa = torch.zeros(self.decoding_order_target.shape[1], device=self.device).unsqueeze(0).long() #This will keep track of AAs that would have been the argmax
         
         self.preset_fixed_S(self.fixed_chain_seq) #This will update S, h_S and decoded_positions with fixed chains; but not individual fixed positions within design chains
@@ -590,42 +674,44 @@ class WrapperProteinMPNN(BaseWrapper):
             return logits, logits
 
         if dummy_run: #All zero if dummy running
-            logits_ = torch.zeros((1, Constants.ALPHABET_SIZE), device=self.device)
-            logits = logits_
-            self.current_logits = logits_.clone()
-            
-        else:                                 
-            logits_ = 0.0
+            self.current_logits = torch.zeros((1, self._NATIVE_VOCAB_SIZE), device=self.device)
+            logits_ = self.current_logits[:, self.alphabet_map]  # remap to OLG-internal
+            logits = logits_.clone()
+
+        else:
+            native_logits = 0.0
             #Decoding position, relative to X/S
-            
             for t_m in t_list:
-                logits_ += self.get_logits(t_m, mask_current=mask_current)
-            self.current_logits = logits_.clone() #Logits at current position, unless it's a stop and > length of protein
-            
+                native_logits += self.get_logits(t_m, mask_current=mask_current)
+            self.current_logits = native_logits.clone()  # kept in native space for log_prob
+
+            # Remap to OLG-internal space for all downstream constraint logic
+            logits_ = self.current_logits[:, self.alphabet_map]
             logits_ -= logits_.mean()
             logits = logits_.clone()
-                
-            #Repeat penalty
+
+            #Repeat penalty (uses model-global t to index into model-global S / decoded_positions)
             logits = self._apply_repetition_penalty(logits, t)
-            
-            #Final logits x some weight/temperature
-            logits = self._apply_weights_and_biases(logits, t)
+
+            # Per-position weight/bias tensors are 0-indexed from protein start; subtract offset.
+            t_local = t - self.config.start_offset
+            logits = self._apply_weights_and_biases(logits, t_local)
 
             count_pos = torch.zeros(self.decoded_positions.shape, device=self.device)
             count_pos[:, self.target_chain_offset:(self.target_chain_offset+self.target_chain_length)] = 1
             count_pos = (self.decoded_positions * count_pos) == 1
-            
-            #These suppress some AA's on hard thresholding of their counts
-            #aa_count = torch.nn.functional.one_hot(self.S[:,self.target_chain_offset:(self.target_chain_offset+self.target_chain_length)], num_classes=Constants.ALPHABET_SIZE).sum(1)
-            aa_count = torch.nn.functional.one_hot(self.S[:,count_pos[0]], num_classes=Constants.ALPHABET_SIZE).sum(1)
+
+            # aa_count in OLG-internal space (S stores native tokens, new-letter slots are zero)
+            aa_count = torch.nn.functional.one_hot(self.S[:,count_pos[0]], num_classes=self.alphabet_size).sum(1)
             max_aa = (aa_count >= self.config.max_aa_count)
             logits[max_aa] = Constants.MIN_LOGIT
 
-            #Positive AA total counts
-            if (aa_count[0, 6] + aa_count[0, 8] + aa_count[0, 14]) >= self.config.max_pos_count: #This is for positively charged AA's; H/K/R
-                logits[0, 6] = Constants.MIN_LOGIT
-                logits[0, 8] = Constants.MIN_LOGIT
-                logits[0, 14] = Constants.MIN_LOGIT
+            #Positive AA total counts (H/K/R)
+            if self.pos_charged_indices and (
+                sum(aa_count[0, i] for i in self.pos_charged_indices) >= self.config.max_pos_count
+            ):
+                for i in self.pos_charged_indices:
+                    logits[0, i] = Constants.MIN_LOGIT
 
             logits = BaseWrapper._top_p(logits, self.config.truncate_topp) #Top-p filtering
         
@@ -663,7 +749,7 @@ class WrapperProteinMPNN(BaseWrapper):
         #Fixed chains
         if fixed_chain_seq is not None:
             for chain_letter, seq in fixed_chain_seq: #List of tuples (chain, sequence)
-                seq_token = torch.tensor([ Constants.ALPHABET.index(c) for c in seq ], device=self.device)
+                seq_token = torch.tensor([ self._NATIVE_VOCAB.get(c, self._NATIVE_VOCAB['X']) for c in seq ], device=self.device)
                 start = self.chain_offsets[self.all_chains.index(chain_letter)]
                 end = start + len(seq)
                 self.S[:, start:end] = seq_token
@@ -672,7 +758,7 @@ class WrapperProteinMPNN(BaseWrapper):
             if self.fixed_chains is not None:
                 for chain_letter in self.fixed_chains:
                     seq = self.pdb_data["seq_chain_"+chain_letter]
-                    seq_token = torch.tensor([ Constants.ALPHABET.index(c) for c in seq ], device=self.device)
+                    seq_token = torch.tensor([ self._NATIVE_VOCAB.get(c, self._NATIVE_VOCAB['X']) for c in seq ], device=self.device)
                     start = self.chain_offsets[self.all_chains.index(chain_letter)]
                     end = start + len(seq)
                     self.S[:, start:end] = seq_token
@@ -730,19 +816,24 @@ class WrapperProteinMPNN(BaseWrapper):
         else:
             t = use_t
         
+        # S_t is OLG-internal; convert to native for model embedding and log_prob indexing
+        native_S_t = self.alphabet_map[S_t]
+
         if not self.tied:
-            self.edit_S(t, S_t, inplace=True)
+            self.edit_S(t, native_S_t, inplace=True)
             self.decoded_positions[0, t] = 1.0
         else:
             for t in t_list:
-                self.edit_S(t, S_t, inplace=True)
+                self.edit_S(t, native_S_t, inplace=True)
                 self.decoded_positions[0, t] = 1.0
-        
-        self.selected_aa[:, t] = S_t
-        log_softmax = torch.log(torch.nn.functional.softmax(self.current_logits[0], dim=-1))
-        self.selected_log_prob[:, t] = log_softmax[S_t]
-        self.log_prob[t, :] = log_softmax
-        self.argmax_aa[:, t] = self.current_logits[0].argmax()
+
+        # Per-position arrays (selected_aa, log_prob, etc.) are 0-indexed from protein start.
+        t_local = t - self.target_chain_offset - self.config.start_offset
+        self.selected_aa[:, t_local] = S_t  # store OLG-internal token
+        log_softmax = torch.log(torch.nn.functional.softmax(self.current_logits[0], dim=-1))  # native space
+        self.selected_log_prob[:, t_local] = log_softmax[native_S_t]
+        self.log_prob[t_local, :] = log_softmax
+        self.argmax_aa[:, t_local] = self.current_logits[0].argmax()
         
     def get_likelihoods(
         self, 
@@ -824,7 +915,8 @@ class WrapperProteinMPNN(BaseWrapper):
     def get_prot_seq(self, S: Optional[torch.Tensor] = None) -> Optional[str]:
         if S is None:
             S = self.S[:, self.target_chain_offset:(self.target_chain_offset+self.target_chain_length)] #Sequence for only design target chain
-        prot = ''.join([Constants.ALPHABET[s.item()] for s in S[0, :]])
+        # S stores native tokens; convert to OLG-internal via alphabet_map_rev, then to chars
+        prot = ''.join([self.alphabet[self.alphabet_map_rev[s.item()].item()] for s in S[0, :]])
         return prot
 
     def get_tied_positions(self) -> list[int]:
@@ -855,11 +947,12 @@ class WrapperProteinMPNN(BaseWrapper):
             logits, logits_ = self.decode_next(mask_current=mask_current)
             if use_S is None:
                 probs = torch.nn.functional.softmax(logits/temp, dim=-1)
-                S_t = torch.multinomial(probs[0], 1)
+                S_t = torch.multinomial(probs[0], 1)  # OLG-internal
             else:
                 t = self.decoding_order[:, i]
                 if not (self.config.force_stop and (t == self.end_pos)):
-                    S_t = use_S[t]
+                    # use_S stores native tokens; convert to OLG-internal for update_S
+                    S_t = self.alphabet_map_rev[use_S[t]]
                 else:
                     S_t = None
             self.update_S(S_t, alphabet_map=False)

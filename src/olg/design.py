@@ -51,6 +51,8 @@ class OLGDesign():
         config: DesignConfig
     ):
         self.config = config
+        self.alphabet_size = config.alphabet_size
+        self.stop_index = config.stop_index
         self.coords = Coordinates(self.config)
         self.compatibility = CodonCompatibility(self.config)
         
@@ -124,7 +126,8 @@ class OLGDesign():
             "config": self.config.protein1 if frame == 0 else self.config.protein2,
             "decoding_order": self.decoding_orders[frame],
             "rand_base": self.config.rand_base,
-            "tqdm_disable": self.config.tqdm_disable
+            "tqdm_disable": self.config.tqdm_disable,
+            "alphabet": self.config.alphabet,  # flows to BaseWrapper.__init__
         }
 
         kwargs.update(shared_params)
@@ -215,15 +218,15 @@ class OLGDesign():
         overlapping_t = True
         if t_f1 != -1: #If the protein exists at this position, we get the next amino acid logit vector from the decoder
             logits_f1, logits_f1_ = self.decoders[0].decode_next(dummy_run[0], mask_current[0])
-        else: 
-            logits_f1 = torch.zeros((1, Constants.ALPHABET_SIZE), device=self.config.device)
-            logits_f1_ = torch.zeros((1, Constants.ALPHABET_SIZE), device=self.config.device)
+        else:
+            logits_f1 = torch.zeros((1, self.alphabet_size), device=self.config.device)
+            logits_f1_ = torch.zeros((1, self.alphabet_size), device=self.config.device)
             overlapping_t = False #If the protein is not overlapping, we zero the logit vector
         if t_f2 != -1: #
             logits_f2, logits_f2_ = self.decoders[1].decode_next(dummy_run[1], mask_current[1])
         else:
-            logits_f2 = torch.zeros((1, Constants.ALPHABET_SIZE), device=self.config.device)
-            logits_f2_ = torch.zeros((1, Constants.ALPHABET_SIZE), device=self.config.device)
+            logits_f2 = torch.zeros((1, self.alphabet_size), device=self.config.device)
+            logits_f2_ = torch.zeros((1, self.alphabet_size), device=self.config.device)
             overlapping_t = False
         
         #Joint probabilities is the pair-wise sum of logits
@@ -437,7 +440,43 @@ class OLGDesign():
         f1_prot = self.decoders[0].get_prot_seq()
         f2_prot = self.decoders[1].get_prot_seq()
         return f1_prot, f2_prot
-    
+
+    def translate_sequences(self) -> Tuple[str, str]:
+        """Translate both proteins from the NT sequence using the configured codon table.
+
+        Independent of model wrapper vocabularies — correctly handles extended
+        alphabets (e.g. S/J serine split) and all frame arrangements, including
+        reverse-strand proteins.  Calls ``string_quartet()`` internally to
+        materialise the current NT sequence.  Stop codons terminate each
+        sequence and are not included in the output.
+
+        Returns:
+            Tuple of (protein1_seq, protein2_seq) as amino acid strings.
+        """
+        nt_seq, _ = self.string_quartet()
+        codon_table = self.compatibility.codon_table  # resolved dict (NCBI name expanded)
+        f1_offset, f2_offset, f2_reverse = Constants.ARRANGEMENT_CONFIG[int(self.config.arrangement)]
+
+        def _codon(p: int, nt_offset: int, reverse: bool) -> str:
+            c = nt_seq[3 * p + nt_offset : 3 * p + nt_offset + 3]
+            return Constants._reverse_complement(c) if reverse else c
+
+        prot1 = []
+        for i in range(len(self.coords.f1_to_all)):
+            aa = codon_table.get(_codon(self.coords.f1_to_all[i].item(), f1_offset, False), "?")
+            if aa == "X":
+                break
+            prot1.append(aa)
+
+        prot2 = []
+        for i in range(len(self.coords.f2_to_all)):
+            aa = codon_table.get(_codon(self.coords.f2_to_all[i].item(), f2_offset, f2_reverse), "?")
+            if aa == "X":
+                break
+            prot2.append(aa)
+
+        return "".join(prot1), "".join(prot2)
+
     def get_scores(
         self, 
         positions: Tuple[Optional[torch.Tensor]] = (None, None)
@@ -716,7 +755,7 @@ class OLGDesign():
         if self.config.protein1.force_stop:
             q_i = quartets[self.coords.f1_to_all[-1]]
             aa_f1 = self.compatibility.quartets_aa[q_i][Constants.FRAME_F1[self.config.arrangement]]
-            aa_i = Constants.STOP_INDEX
+            aa_i = self.stop_index
             if aa_f1 != aa_i:
                 failed = True
                 failed_res += [ (0, None, 'Stop') ]
@@ -726,7 +765,7 @@ class OLGDesign():
         if self.config.protein2.force_stop:
             q_i = quartets[self.coords.f2_to_all[-1]]
             aa_f2 = self.compatibility.quartets_aa[q_i][Constants.FRAME_F2[self.config.arrangement]]
-            aa_i = Constants.STOP_INDEX
+            aa_i = self.stop_index
             if aa_f2 != aa_i:
                 failed = True
                 failed_res += [ (1, None, 'Stop') ]
