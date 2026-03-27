@@ -66,16 +66,17 @@ def main() -> None:
     p2_aa_bias[alphabet_index["J"]] = Constants.MIN_LOGIT
 
     # logit_weight=0 and logit_bias for S/G at extension positions for protein2.
-    # Extension positions: padded positions minus forced start/stop.
+    # Extension positions: padded positions minus forced start.
     #   N-term: positions 1..pad_n-1 (position 0 is forced Met)
-    #   C-term: positions (length - pad_c)..(length - 2) (last position is forced Stop)
+    #   C-term: positions (length - pad_c)..(length - 1)
+    #   (force_stop adds stop BEYOND config.length; all P2_LENGTH positions are real protein)
     p2_logit_weight = torch.ones(P2_LENGTH, device=device)
     p2_logit_bias = torch.zeros((P2_LENGTH, len(alphabet)), device=device)
 
     ext_positions = []
     ext_positions.extend(range(1, P2_PAD[0]))           # N-term extensions (skip Met at 0)
-    ext_positions.extend(range(P2_LENGTH - P2_PAD[1],    # C-term extensions (skip Stop at end)
-                               P2_LENGTH - 1))
+    ext_positions.extend(range(P2_LENGTH - P2_PAD[1],    # C-term extensions
+                               P2_LENGTH))
     for pos in ext_positions:
         p2_logit_weight[pos] = 0.0
         p2_logit_bias[pos, alphabet_index["S"]] = 1.0
