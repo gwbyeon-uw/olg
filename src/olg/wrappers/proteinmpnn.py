@@ -409,7 +409,7 @@ class WrapperProteinMPNN(BaseWrapper):
         if len(self.fixed_chains) > 0:
             fixed_chain_positions = []
             for chain_letter in self.fixed_chains:
-                fixed_chain_positions += [ torch.nonzero(self.chain_encoding[0, :] == (self.all_chains.index(chain_letter)), device=self.device)[:, 0] ] #The positions here are relative to X/S.
+                fixed_chain_positions += [ torch.nonzero(self.chain_encoding[0, :] == self.all_chains.index(chain_letter))[:, 0] ] #The positions here are relative to X/S.
             self.fixed_chain_positions = torch.cat(fixed_chain_positions).unsqueeze(0)
             rand_order = torch.argsort(torch.rand(self.fixed_chain_positions.shape[1])) #Randomize the order within fixed chain positions
             self.decoding_order_S = torch.cat([ self.fixed_chain_positions[:, rand_order], self.decoding_order_target_und ], dim=1) #Now the decoding order for X/S has fixed chains before target chain; this is the decoding order to be provided to forward pass function of the model
@@ -452,7 +452,7 @@ class WrapperProteinMPNN(BaseWrapper):
             self.S = seed_S.clone()
             self.h_S = self.model.W_s(self.S)
 
-        self.gap_map = torch.arange(self.decoding_order_S.shape[1], device=self.device) #Dummy; to keep compatible with models with gap
+        self.gap_map = torch.arange(self.target_chain_length, device=self.device) #Dummy; to keep compatible with models with gap
         self.gap_map_rev = self.gap_map.clone()
         
         self.current_logits = None

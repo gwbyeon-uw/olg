@@ -1,10 +1,11 @@
-from dataclasses import dataclass, field
+from collections import defaultdict
+from dataclasses import dataclass, field, asdict
 from typing import Literal, Optional, Dict
 from pathlib import Path
 import gc
 import os
-from dataclasses import asdict
 import random
+import subprocess
 
 import torch
 import torch.nn as nn
@@ -12,12 +13,81 @@ import numpy as np
 
 from boltz.model.models.boltz2 import Boltz2
 from boltz.main import Boltz2DiffusionParams, BoltzSteeringParams, PairformerArgsV2, MSAModuleArgs
+from boltz.data.parse.a3m import parse_a3m
 from boltz.data.parse.schema import parse_boltz_schema
 from boltz.data.mol import load_canonicals, load_molecules
+from boltz.data.msa.mmseqs2 import run_mmseqs2
 from boltz.data.types import Coords, Ensemble, StructureV2, MSA, Input
 from boltz.data.tokenize.boltz2 import Boltz2Tokenizer
 from boltz.data.feature.featurizerv2 import Boltz2Featurizer
 from boltz.data.write.pdb import to_pdb
+
+# ---------------------------------------------------------------------------
+# Constants & helpers adapted from Protein-Hunter
+# ---------------------------------------------------------------------------
+
+CHAIN_TO_NUMBER = {chr(ord("A") + i): i for i in range(26)}
+
+
+def smart_split(s: str) -> list[str]:
+    """Split a string on comma, colon, or whitespace (in that priority order)."""
+    if not s:
+        return []
+    if "," in s:
+        return [x.strip() for x in s.split(",")]
+    if ":" in s:
+        return [x.strip() for x in s.split(":")]
+    return [x.strip() for x in s.split()]
+
+
+def get_cif(cif_code: str = "") -> str:
+    """Return local path to a CIF/PDB file, fetching from RCSB or AlphaFold if needed."""
+    if not cif_code:
+        raise ValueError("No CIF code or path specified.")
+    if os.path.isfile(cif_code):
+        return os.path.abspath(cif_code)
+    if len(cif_code) == 4:
+        local_cif = f"{cif_code}.cif"
+        if not os.path.isfile(local_cif):
+            subprocess.run(
+                ["wget", "-qnc", f"https://files.rcsb.org/download/{cif_code}.cif"],
+                check=True,
+            )
+        return os.path.abspath(local_cif)
+    # AlphaFold ID
+    local_cif = f"AF-{cif_code}-F1-model_v3.cif"
+    if not os.path.isfile(local_cif):
+        subprocess.run(
+            ["wget", "-qnc", f"https://alphafold.ebi.ac.uk/files/AF-{cif_code}-F1-model_v3.cif"],
+            check=True,
+        )
+    return os.path.abspath(local_cif)
+
+
+def process_msa(chain_id: str, sequence: str, msa_dir: Path) -> Path:
+    """Run MMseqs2 MSA search and return path to Boltz-format .npz file."""
+    msa_chain_dir = msa_dir / f"{chain_id}"
+    env_dir = msa_chain_dir.with_name(f"{msa_chain_dir.name}_env")
+    env_dir.mkdir(exist_ok=True, parents=True)
+
+    unpaired_msa = run_mmseqs2(
+        [sequence],
+        str(msa_chain_dir),
+        use_env=True,
+        use_pairing=False,
+        host_url="https://api.colabfold.com",
+        pairing_strategy="greedy",
+    )
+
+    msa_a3m_path = env_dir / "msa.a3m"
+    msa_a3m_path.write_text(unpaired_msa[0])
+
+    msa_npz_path = env_dir / "msa.npz"
+    if not msa_npz_path.exists():
+        msa = parse_a3m(msa_a3m_path, taxonomy=None, max_seqs=4096)
+        msa.dump(msa_npz_path)
+
+    return msa_npz_path
 
 @dataclass
 class BoltzPHConfig:
@@ -193,34 +263,43 @@ class BoltzPHWrapper:
     
     #See https://github.com/yehlincho/Protein-Hunter/blob/main/boltz_ph/model_utils.py
     @staticmethod
-    def load_model(checkpoint_path, device):
-        predict_args = {    
-            "recycling_steps": 3,
-            "sampling_steps": 200,
+    def load_model(
+        checkpoint_path,
+        device,
+        no_potentials: bool = True,
+        recycling_steps: int = 3,
+        sampling_steps: int = 200,
+    ):
+        predict_args = {
+            "recycling_steps": recycling_steps,
+            "sampling_steps": sampling_steps,
             "diffusion_samples": 1,
             "write_confidence_summary": True,
             "write_full_pae": False,
             "write_full_pde": False,
             "max_parallel_samples": 1,
         }
-        
+
         diffusion_params = Boltz2DiffusionParams()
-        diffusion_params.step_scale = 1.638 #1.5?
-        
+        diffusion_params.step_scale = 1.638
+
         steering_args = BoltzSteeringParams()
-        #if no_potentials:
-        steering_args.fk_steering = False
-        steering_args.guidance_update = False
-        
+        if no_potentials:
+            steering_args.fk_steering = False
+            steering_args.physical_guidance_update = False
+            steering_args.contact_guidance_update = False
+        # else: defaults (fk=False, physical=False, contact=True) match
+        # Protein-Hunter's binder mode with contact steering enabled.
+
         pairformer_args = PairformerArgsV2()
         pairformer_args.v2 = True
         pairformer_args.activation_checkpointing = True
-        
+
         msa_args = MSAModuleArgs(subsample_msa=True, num_subsampled_msa=1024, use_paired_feature=True)
         msa_args.activation_checkpointing = True
 
         model_module = Boltz2.load_from_checkpoint(
-            checkpoint_path=os.path.expanduser(checkpoint_path),#"./boltz2_conf.ckpt"),
+            checkpoint_path=os.path.expanduser(checkpoint_path),
             strict=False,
             predict_args=predict_args,
             map_location=device,
@@ -348,6 +427,27 @@ class BoltzPHWrapper:
             batch["record"] = target.record
     
         return batch, structure
+
+    @staticmethod
+    def compute_iptm(output, binder_chain="A"):
+        """Extract mean inter-chain ipTM for the binder from Boltz2 output.
+
+        Returns 0.0 for single-chain (monomer) predictions.
+        """
+        pair_chains = output.get("pair_chains_iptm")
+        if pair_chains is None or len(pair_chains) <= 1:
+            return 0.0
+        binder_idx = CHAIN_TO_NUMBER[binder_chain]
+        values = [
+            (
+                pair_chains[binder_idx][i].detach().cpu().item()
+                + pair_chains[i][binder_idx].detach().cpu().item()
+            )
+            / 2.0
+            for i in pair_chains
+            if i != binder_idx
+        ]
+        return float(np.mean(values)) if values else 0.0
 
     #https://github.com/yehlincho/Protein-Hunter/blob/main/boltz_ph/model_utils.py
     @staticmethod

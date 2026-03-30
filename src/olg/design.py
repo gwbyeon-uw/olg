@@ -525,19 +525,40 @@ class OLGDesign():
 
         raise DecodingError(f"decode_all failed after {retry} retries")
             
+    @staticmethod
+    def _slice_to_target_chain(decoder, score: torch.Tensor) -> torch.Tensor:
+        """Slice a full-model score tensor to target chain positions only.
+
+        When a decoder has fixed context chains (e.g. ProteinMPNN with
+        fixed_chains), its tensors cover all chains.  OLG's coordinate system
+        only tracks the target (design) chain, so we need to slice.
+        """
+        offset = getattr(decoder, "target_chain_offset", 0)
+        length = getattr(decoder, "target_chain_length", None)
+        if length is None:
+            return score
+        # Convert CUDA scalar tensors to Python ints for slicing
+        offset = int(offset)
+        length = int(length)
+        return score[offset:offset + length]
+
     def _map_score_positions(self, f1_score: torch.Tensor, f2_score: torch.Tensor) -> torch.Tensor:
         """Helper to handle coordinate mapping between absolute position and protein-relative position for decoding order function"""
+        # Slice to target chain if decoder has fixed context chains
+        f1_score = self._slice_to_target_chain(self.decoders[0], f1_score)
+        f2_score = self._slice_to_target_chain(self.decoders[1], f2_score)
+
         positions = torch.zeros((2, self.coords.total_len), device=self.config.device)
-        
+
         f1_abs_position = self.coords.f1_to_all[self.coords.f1_to_all!=(self.coords.f1_to_all.max()+1-(self.config.protein1.force_stop+0))]
         f1_protein_position = self.decoders[0].gap_map_rev[self.decoders[0].gap_map_rev!=-1]
 
         f2_abs_position = self.coords.f2_to_all[self.coords.f2_to_all!=(self.coords.f2_to_all.max()+1-(self.config.protein2.force_stop+0))]
         f2_protein_position = self.decoders[1].gap_map_rev[self.decoders[1].gap_map_rev!=-1]
-        
+
         positions[0, f1_abs_position] = f1_score[f1_protein_position]
         positions[1, f2_abs_position] = f2_score[f2_protein_position]
-        
+
         return positions
     
     def _apply_masks_and_sort(self, positions: torch.Tensor, prioritize_fixed: bool):
@@ -575,32 +596,36 @@ class OLGDesign():
         """
         if ordering == "entropy":
             if frames[0]:
-                f1_curr_pred = self.decoders[0].current_pred[self.config.protein1.start_offset:self.config.protein1.length, :]
+                f1_curr_pred = self._slice_to_target_chain(self.decoders[0], self.decoders[0].current_pred)[self.config.protein1.start_offset:self.config.protein1.length, :]
                 f1_log_prob = torch.log(torch.nn.functional.softmax(f1_curr_pred, dim=-1))[:, self.decoders[0].alphabet_map]
             else:
-                f1_log_prob = torch.zeros(self.decoders[0].current_pred.shape, device=self.config.device)[self.config.protein1.start_offset:self.config.protein1.length, self.decoders[0].alphabet_map]
+                f1_len = self.config.protein1.length - self.config.protein1.start_offset
+                f1_log_prob = torch.zeros(f1_len, len(self.decoders[0].alphabet_map), device=self.config.device)
             if frames[1]:
-                f2_curr_pred = self.decoders[1].current_pred[self.config.protein2.start_offset:self.config.protein2.length, :]
+                f2_curr_pred = self._slice_to_target_chain(self.decoders[1], self.decoders[1].current_pred)[self.config.protein2.start_offset:self.config.protein2.length, :]
                 f2_log_prob = torch.log(torch.nn.functional.softmax(f2_curr_pred, dim=-1))[:, self.decoders[1].alphabet_map]
             else:
-                f2_log_prob = torch.zeros(self.decoders[1].current_pred.shape, device=self.config.device)[self.config.protein2.start_offset:self.config.protein2.length, self.decoders[1].alphabet_map]
+                f2_len = self.config.protein2.length - self.config.protein2.start_offset
+                f2_log_prob = torch.zeros(f2_len, len(self.decoders[1].alphabet_map), device=self.config.device)
 
             f1_entropy = -1.0 * torch.sum(torch.exp(f1_log_prob) * f1_log_prob, 1)
             f2_entropy = -1.0 * torch.sum(torch.exp(f2_log_prob) * f2_log_prob, 1)
-            
+
             positions = self._map_score_positions(f1_entropy, f2_entropy)
-            
+
         elif ordering == "prob":
             if frames[0]:
-                f1_curr_pred = self.decoders[0].current_pred[self.config.protein1.start_offset:self.config.protein1.length, :]
+                f1_curr_pred = self._slice_to_target_chain(self.decoders[0], self.decoders[0].current_pred)[self.config.protein1.start_offset:self.config.protein1.length, :]
                 f1_max_log_prob = torch.log(torch.nn.functional.softmax(f1_curr_pred, dim=-1))[:, self.decoders[0].alphabet_map].max(-1)[0]
             else:
-                f1_max_log_prob = torch.zeros(self.decoders[0].current_pred.shape, device=self.config.device)[self.config.protein1.start_offset:self.config.protein1.length]
+                f1_len = self.config.protein1.length - self.config.protein1.start_offset
+                f1_max_log_prob = torch.zeros(f1_len, device=self.config.device)
             if frames[1]:
-                f2_curr_pred = self.decoders[1].current_pred[self.config.protein2.start_offset:self.config.protein2.length, :]
+                f2_curr_pred = self._slice_to_target_chain(self.decoders[1], self.decoders[1].current_pred)[self.config.protein2.start_offset:self.config.protein2.length, :]
                 f2_max_log_prob = torch.log(torch.nn.functional.softmax(f2_curr_pred, dim=-1))[:, self.decoders[1].alphabet_map].max(-1)[0]
             else:
-                f2_max_log_prob = torch.zeros(self.decoders[1].current_pred.shape, device=self.config.device)[self.config.protein2.start_offset:self.config.protein2.length]
+                f2_len = self.config.protein2.length - self.config.protein2.start_offset
+                f2_max_log_prob = torch.zeros(f2_len, device=self.config.device)
 
             positions = self._map_score_positions(f1_max_log_prob, f2_max_log_prob)
 
@@ -632,20 +657,24 @@ class OLGDesign():
         positions = torch.zeros((2, self.coords.total_len), device=self.config.device)
         
         if ordering == "entropy":
-            f1_log_prob = self.decoders[0].log_prob[:, self.decoders[0].alphabet_map]
-            f2_log_prob = self.decoders[1].log_prob[:, self.decoders[1].alphabet_map]
+            f1_log_prob = self._slice_to_target_chain(self.decoders[0], self.decoders[0].log_prob)[:, self.decoders[0].alphabet_map]
+            f2_log_prob = self._slice_to_target_chain(self.decoders[1], self.decoders[1].log_prob)[:, self.decoders[1].alphabet_map]
             f1_entropy = -1.0 * torch.sum(torch.exp(f1_log_prob) * f1_log_prob, 1)
             f2_entropy = -1.0 * torch.sum(torch.exp(f2_log_prob) * f2_log_prob, 1)
             positions = self._map_score_positions(f1_entropy, f2_entropy)
         elif ordering == "prob":
-            f1_selected_log_prob = self.decoders[0].selected_log_prob[0]
-            f2_selected_log_prob = self.decoders[1].selected_log_prob[0]
+            f1_selected_log_prob = self._slice_to_target_chain(self.decoders[0], self.decoders[0].selected_log_prob[0])
+            f2_selected_log_prob = self._slice_to_target_chain(self.decoders[1], self.decoders[1].selected_log_prob[0])
             positions = self._map_score_positions(f1_selected_log_prob, f2_selected_log_prob)
         elif ordering == "prob_rank":
-            prob_1 = self.decoders[0].selected_log_prob[0]
-            prob_2 = self.decoders[1].selected_log_prob[0]
-            prob_rank_1 = self.decoders[0].log_prob.sort(1)[1].gather(1, self.decoders[0].S.permute([1,0]))[:,0]
-            prob_rank_2 = self.decoders[1].log_prob.sort(1)[1].gather(1, self.decoders[1].S.permute([1,0]))[:,0]
+            prob_1 = self._slice_to_target_chain(self.decoders[0], self.decoders[0].selected_log_prob[0])
+            prob_2 = self._slice_to_target_chain(self.decoders[1], self.decoders[1].selected_log_prob[0])
+            lp_1 = self._slice_to_target_chain(self.decoders[0], self.decoders[0].log_prob)
+            lp_2 = self._slice_to_target_chain(self.decoders[1], self.decoders[1].log_prob)
+            S_1 = self._slice_to_target_chain(self.decoders[0], self.decoders[0].S[0]).unsqueeze(1)
+            S_2 = self._slice_to_target_chain(self.decoders[1], self.decoders[1].S[0]).unsqueeze(1)
+            prob_rank_1 = lp_1.sort(1)[1].gather(1, S_1)[:,0]
+            prob_rank_2 = lp_2.sort(1)[1].gather(1, S_2)[:,0]
             prob_rank_1 += prob_1 * Constants.EPS
             prob_rank_2 += prob_2 * Constants.EPS
             positions = self._map_score_positions(prob_rank_1, prob_rank_2)
