@@ -45,6 +45,13 @@ except ImportError:
     print("Skipping EvoDiff wrapper")
     evodiff_avail = False
 
+try:
+    from olg.wrappers.msa_pairformer import WrapperMSAPairformer
+    msa_pairformer_avail = True
+except ImportError:
+    print("Skipping MSA Pairformer wrapper")
+    msa_pairformer_avail = False
+
 class OLGDesign():
     def __init__(
         self,
@@ -139,6 +146,7 @@ class OLGDesign():
             "ESM3": WrapperESM3 if esm3_avail else None,
             "CoFlow": WrapperCoFlow if coflow_avail else None,
             "EvoDiff": WrapperEvoDiff if evodiff_avail else None,
+            "MSAPairformer": WrapperMSAPairformer if msa_pairformer_avail else None,
         }
 
         cls = decoder_classes.get(decoder_type)

@@ -13,6 +13,7 @@ This framework uses generative protein models to design synthetic OLGs. The core
 | Model | Notes |
 |-------|-------|
 | **ProteinMPNN** | Supports complexes via tied decoding |
+| **MSA Pairformer** | Requires `msa-pairformer` package; MSA-based with contact prediction |
 | **ESM3** | Requires `esm` package |
 | **CoFlow** | Requires `coflow` package |
 | **EvoDiff-MSA** | Requires `evodiff` package; supports shared MSA mode |
@@ -213,6 +214,116 @@ Padding is not supported with `tied=True` (complexes).
 | `3` | +2 | Protein 2 in +2 frame (same strand) |
 | `4` | -2 | Protein 2 in -2 frame (reverse strand) |
 
+### Multi-chain context (binder design)
+
+When designing an overlap protein that should bind a target, ProteinMPNN can condition on both the binder structure and the target structure simultaneously. Pass `fixed_chains` to keep target chains as structural context while designing only the binder chain:
+
+```python
+# Load a complex PDB with chain A (binder) and chain B (target)
+olg.initialize_decoder(
+    "ProteinMPNN", frame=1, model=model,
+    ca_only=True, pdb_path="complex.pdb",
+    fixed_chains=["B"],       # target structure as fixed context
+    design_chains=["A"],      # binder chain to design
+)
+```
+
+Fixed chains are encoded first in the autoregressive pass, so every logit prediction for the design chain is conditioned on the target's structure and sequence.
+
+### MSA Pairformer
+
+[MSA Pairformer](https://github.com/yoakiyama/MSA_Pairformer) is a lightweight MSA transformer that produces per-position amino acid logits from multiple sequence alignments. It also provides optional contact predictions (Cb-Cb and ConFind).
+
+**Installation:**
+
+```bash
+git clone https://github.com/yoakiyama/MSA_Pairformer.git
+pip install -e MSA_Pairformer
+```
+
+**Basic usage:**
+
+```python
+from olg.wrappers.msa_pairformer import WrapperMSAPairformer
+
+# Load model (downloads weights from HuggingFace on first run)
+model = WrapperMSAPairformer._load_model(device, weights_dir="weights/msa_pairformer")
+
+# Parse MSA (list of aligned sequences from a3m/fasta file)
+headers, seqs = WrapperMSAPairformer.parse_fasta("my_protein.a3m")
+msa_seqs = [str(s) for s in seqs]
+
+# Initialize decoder
+olg.initialize_decoder(
+    "MSAPairformer", frame=0, model=model,
+    msa_seqs=msa_seqs,
+    msa_n_seq=128,             # MSA depth (default 128; 64-256 recommended)
+    msa_max_length=100,        # sequence length (must match config.length minus padding)
+    msa_selection_type='MaxHamming',  # diversity selection: 'random', 'MaxHamming', 'MaxHammingI'
+    seed_from_msa=True,        # seed query row from MSA (recommended)
+)
+```
+
+**Key parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `msa_n_seq` | `128` | MSA depth. 64-256 recommended for good contact prediction |
+| `msa_max_length` | — | Sequence length matching the MSA columns |
+| `msa_selection_type` | `'random'` | `'MaxHamming'` for diverse subsampling |
+| `seed_from_msa` | `False` | Seed query from MSA query sequence. Recommended — keeps masking close to training distribution |
+| `use_bfloat16` | `True` | bfloat16 autocast for GPU inference |
+| `pad` | `(0, 0)` | N/C-terminal padding (positions excluded from model, steered via `logit_weight`/`aa_bias`) |
+
+**Contact predictions** (optional, outside DecoderProtocol):
+
+```python
+contacts = olg.decoders[0].get_contacts()
+cb_contacts = contacts['cb_contacts']         # [1, L, L] Cb-Cb contacts
+confind_contacts = contacts['confind_contacts']  # [1, L, L] interface contacts
+```
+
+**Notes:**
+- MSA Pairformer is trained with 15% BERT-style masking. Starting from a fully masked query (default) is out-of-distribution. Use `seed_from_msa=True` for better initial sequences.
+- Padding positions are trimmed before the model forward pass and zero-padded on output. Use `logit_weight=0` and `aa_bias` to steer padded positions.
+- The model runs a full forward pass per decoding position (~80-180ms depending on MSA depth). Gibbs refinement iterations each take ~20s for 100-residue proteins on an L4 GPU.
+
+### Structure hallucination with Boltz2
+
+The `structure/boltz.py` module wraps [Boltz2](https://github.com/jwohlwend/boltz) for structure prediction, adapted from [Protein-Hunter](https://github.com/yehlincho/Protein-Hunter). It supports both monomer fold prediction and multi-chain binder hallucination:
+
+```python
+from olg.structure.boltz import BoltzPHWrapper, BoltzPHConfig
+
+# Load model (no_potentials=False enables contact steering for binder mode)
+boltz_model = BoltzPHWrapper.load_model("boltz2_conf.ckpt", device, no_potentials=False)
+
+# Configure for binder design
+config = BoltzPHConfig(
+    mode="binder",                         # multi-chain: A=binder, B=target
+    protein_seqs="MKTLLF...",              # target protein sequence
+    msa_mode="single",                     # or "mmseqs" for MSA search
+    contact_residues="5,10,15",            # optional: pocket steering
+    randomly_kill_helix_feature=True,      # encourage diverse folds
+    ccd_path="weights/mols",
+)
+
+# Predict complex
+boltz_ph = BoltzPHWrapper(boltz_model, config)
+boltz_ph.reset()
+output, structure = boltz_ph.run_prediction(binder_seq, "A", "complex.pdb")
+
+# Extract binding metrics
+iptm = BoltzPHWrapper.compute_iptm(output, "A")   # inter-chain TM-score
+plddt = output["plddt"].mean().item()               # predicted LDDT
+```
+
+Binder hallucination tricks (from Protein-Hunter):
+- **Multi-chain input**: target sequence as chain B; binder as chain A with "X" placeholder
+- **Contact steering**: pocket constraints guide diffusion toward specific target residues
+- **Helix killing**: disrupts i→i+4 pairwise features on the binder chain, encouraging diverse folds
+- **ipTM tracking**: inter-chain predicted TM-score as the binding quality metric
+
 ## Project structure
 
 ```
@@ -229,13 +340,14 @@ src/olg/
   wrappers/
     protocol.py          # DecoderProtocol (typing.Protocol)
     base_wrapper.py      # BaseWrapper mixin + ZeroOrderWrapper
-    proteinmpnn.py       # ProteinMPNN wrapper
+    proteinmpnn.py       # ProteinMPNN wrapper (supports multi-chain with fixed context)
     esm3.py              # ESM3 wrapper
     coflow.py            # CoFlow wrapper
     evodiff.py           # EvoDiff-MSA wrapper
+    msa_pairformer.py    # MSA Pairformer wrapper (MSA-based + contact prediction)
     gremlin.py           # GREMLIN wrapper
   structure/
-    ph_boltz.py          # Boltz2 structure prediction wrapper
+    boltz.py             # Boltz2 wrapper (monomer + binder hallucination)
 ```
 
 ## Citation
