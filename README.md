@@ -288,6 +288,44 @@ confind_contacts = contacts['confind_contacts']  # [1, L, L] interface contacts
 - Padding positions are trimmed before the model forward pass and zero-padded on output. Use `logit_weight=0` and `aa_bias` to steer padded positions.
 - The model runs a full forward pass per decoding position (~80-180ms depending on MSA depth). Gibbs refinement iterations each take ~20s for 100-residue proteins on an L4 GPU.
 
+### Classifier-guided decoding (TAG)
+
+The `GuidedWrapper` adds [Taylor-Approximated Guidance](https://arxiv.org/abs/2406.01572) to any decoder, biasing sampling toward sequences with desired properties (e.g., antimicrobial activity, low hemolysis) without modifying the base model.
+
+```python
+from olg.wrappers.guided import GuidedWrapper
+
+# Initialize base decoder as usual
+olg.initialize_decoder("MSAPairformer", frame=0, model=model, ...)
+
+# Wrap with guidance
+olg.decoders[0] = GuidedWrapper(
+    olg.decoders[0],
+    classifiers=[amp_classifier, hemo_classifier],
+    guide_temp=0.5,          # lower = stronger guidance
+    weights=[1.0, -1.0],    # maximize AMP activity, minimize hemolysis
+)
+
+# Design as normal — guidance is transparent to OLG
+olg.decode_all()
+```
+
+The wrapper only intercepts `decode_next()` to add the classifier gradient signal. All state management, scoring, and sequence tracking delegates to the inner decoder. `get_score()` returns the unguided generative model score (for frame balancing); classifier scores should be evaluated separately.
+
+**Classifier interface** — any classifier implementing `GuidanceClassifier`:
+
+```python
+class MyClassifier:
+    vocab_size: int = 21                                # classifier's token vocabulary size
+    olg_to_clf: torch.Tensor                            # [olg_alphabet_size] mapping
+    def encode_tokens(self, token_ids) -> torch.Tensor: # native → classifier tokens
+        ...
+    def log_prob(self, x_onehot, t) -> torch.Tensor:   # [B, L, V] → [B] log probability
+        ...
+```
+
+The classifier must accept one-hot input (`requires_grad=True`) and return a differentiable scalar log-probability. Use `StraightThroughEmbedding` to make embedding-based classifiers (ESM-2, ProtBERT) differentiable through discrete tokens.
+
 ### Structure hallucination with Boltz2
 
 The `structure/boltz.py` module wraps [Boltz2](https://github.com/jwohlwend/boltz) for structure prediction, adapted from [Protein-Hunter](https://github.com/yehlincho/Protein-Hunter). It supports both monomer fold prediction and multi-chain binder hallucination:
@@ -345,6 +383,7 @@ src/olg/
     coflow.py            # CoFlow wrapper
     evodiff.py           # EvoDiff-MSA wrapper
     msa_pairformer.py    # MSA Pairformer wrapper (MSA-based + contact prediction)
+    guided.py            # GuidedWrapper — TAG classifier guidance for any decoder
     gremlin.py           # GREMLIN wrapper
   structure/
     boltz.py             # Boltz2 wrapper (monomer + binder hallucination)
