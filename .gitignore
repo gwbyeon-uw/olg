@@ -30,3 +30,6 @@ src/olg/wrappers/guidance.py
 
 # Scratch / analysis
 scratch/
+
+# Archived (mexposit APEX, superseded by clean wrapper)
+archive/
