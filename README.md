@@ -14,7 +14,8 @@ This framework uses generative protein models to design synthetic OLGs. The core
 |-------|-------|
 | **ProteinMPNN** | Supports complexes via tied decoding |
 | **MSA Pairformer** | Requires `msa-pairformer` package; MSA-based with contact prediction |
-| **ESM3** | Requires `esm` package |
+| **ESM3** | Requires `esm` package; supports function-conditioned generation |
+| **EvoDiff-seq** | Requires `evodiff` package; single-sequence OADM (no MSA needed) |
 | **CoFlow** | Requires `coflow` package |
 | **EvoDiff-MSA** | Requires `evodiff` package; supports shared MSA mode |
 | **GREMLIN** | Built-in, no extra deps |
@@ -288,6 +289,35 @@ confind_contacts = contacts['confind_contacts']  # [1, L, L] interface contacts
 - Padding positions are trimmed before the model forward pass and zero-padded on output. Use `logit_weight=0` and `aa_bias` to steer padded positions.
 - The model runs a full forward pass per decoding position (~80-180ms depending on MSA depth). Gibbs refinement iterations each take ~20s for 100-residue proteins on an L4 GPU.
 
+### ESM3 with function conditioning
+
+ESM3 supports function-conditioned generation via InterPro annotations and keywords. This enables generating sequences with specific functional properties (e.g., antimicrobial activity) built into the generative model itself.
+
+```python
+olg.initialize_decoder(
+    "ESM3", frame=0, model=esm3_model,
+    function_annotations=[
+        {"label": "IPR004275", "start": 1, "end": 23},   # Frog AMP propeptide
+        {"label": "antimicrobial peptide", "start": 1, "end": 23},
+    ],
+)
+```
+
+AMP-related InterPro entries available in ESM3:
+
+| InterPro ID | Description |
+|------------|-------------|
+| `IPR004275` | Frog antimicrobial peptide, propeptide |
+| `IPR012520` | Frog antimicrobial peptide, brevinin-1 type |
+| `IPR012521` | Frog antimicrobial peptide, brevinin-2/esculentin type |
+| `IPR012524` | Abaecin, antimicrobial peptide |
+| `IPR001542` | Defensin, invertebrate/fungal |
+| `IPR010851` | Defensin-like protein |
+
+Keywords: `antimicrobial`, `antimicrobial peptide`, `defensin`, `bacteriocin`.
+
+Function conditioning can be combined with TAG guidance for dual control: ESM3 generates from the functional family distribution, while the classifier steers toward specific properties (e.g., potency, low hemolysis).
+
 ### Classifier-guided decoding (TAG)
 
 The `GuidedWrapper` adds [Taylor-Approximated Guidance](https://arxiv.org/abs/2406.01572) to any decoder, biasing sampling toward sequences with desired properties (e.g., antimicrobial activity, low hemolysis) without modifying the base model.
@@ -379,7 +409,8 @@ src/olg/
     protocol.py          # DecoderProtocol (typing.Protocol)
     base_wrapper.py      # BaseWrapper mixin + ZeroOrderWrapper
     proteinmpnn.py       # ProteinMPNN wrapper (supports multi-chain with fixed context)
-    esm3.py              # ESM3 wrapper
+    esm3.py              # ESM3 wrapper (supports function-conditioned generation)
+    evodiff_seq.py       # EvoDiff single-sequence OADM wrapper
     coflow.py            # CoFlow wrapper
     evodiff.py           # EvoDiff-MSA wrapper
     msa_pairformer.py    # MSA Pairformer wrapper (MSA-based + contact prediction)

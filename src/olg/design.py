@@ -46,6 +46,13 @@ except ImportError:
     evodiff_avail = False
 
 try:
+    from olg.wrappers.evodiff_seq import WrapperEvoDiffSeq
+    evodiff_seq_avail = True
+except ImportError:
+    print("Skipping EvoDiff-seq wrapper")
+    evodiff_seq_avail = False
+
+try:
     from olg.wrappers.msa_pairformer import WrapperMSAPairformer
     msa_pairformer_avail = True
 except ImportError:
@@ -146,6 +153,7 @@ class OLGDesign():
             "ESM3": WrapperESM3 if esm3_avail else None,
             "CoFlow": WrapperCoFlow if coflow_avail else None,
             "EvoDiff": WrapperEvoDiff if evodiff_avail else None,
+            "EvoDiffSeq": WrapperEvoDiffSeq if evodiff_seq_avail else None,
             "MSAPairformer": WrapperMSAPairformer if msa_pairformer_avail else None,
         }
 

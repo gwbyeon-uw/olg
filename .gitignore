@@ -27,3 +27,6 @@ IMPLEMENTATION_PLAN.md
 
 # Experimental (broken, not ready for use)
 src/olg/wrappers/guidance.py
+
+# Scratch / analysis
+scratch/

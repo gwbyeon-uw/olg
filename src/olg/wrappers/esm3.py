@@ -12,6 +12,35 @@ from olg.config import ProteinConfig
 from .base_wrapper import BaseWrapper
 
 class WrapperESM3(BaseWrapper):
+    """Wrapper for ESM3 multimodal protein language model.
+
+    ESM3 supports conditioning on multiple tracks: sequence, structure, secondary
+    structure, SASA, and function annotations. Function annotations can be used
+    to guide generation toward specific protein families or activities.
+
+    Function conditioning example (antimicrobial peptide):
+        wrapper = WrapperESM3(
+            model=model,
+            function_annotations=[
+                {"label": "IPR004275", "start": 1, "end": 23},  # Frog AMP propeptide
+                {"label": "antimicrobial peptide", "start": 1, "end": 23},
+            ],
+            ...
+        )
+
+    Available AMP-related InterPro entries:
+        IPR004275  Frog antimicrobial peptide, propeptide
+        IPR012520  Frog antimicrobial peptide, brevinin-1 type
+        IPR012521  Frog antimicrobial peptide, brevinin-2/esculentin type
+        IPR012524  Abaecin, antimicrobial peptide
+        IPR012526  Scorpion antimicrobial peptide
+        IPR001542  Defensin, invertebrate/fungal
+        IPR010851  Defensin-like protein
+
+    Available AMP-related keywords:
+        antimicrobial, antimicrobial peptide, defensin, bacteriocin
+    """
+
     # No default remapping: standard OLG letters (including 'X') are in ESM3's tokenizer
     _DEFAULT_EXTRA_AA_MAP: dict[str, str] = {}
 
@@ -20,11 +49,23 @@ class WrapperESM3(BaseWrapper):
         model: nn.Module,
         prefixed_seq: Optional[Tuple[int, int, str]] = None,
         extra_aa_map: Optional[dict[str, str]] = None,
+        function_annotations: Optional[List[dict]] = None,
         **kwargs
     ):
-        """
+        """Initialize ESM3 wrapper.
+
+        Args:
+            model: ESM3 model instance.
+            prefixed_seq: List of (start, end, seq) tuples to pre-fill.
+            extra_aa_map: Override for alphabet mapping.
+            function_annotations: List of dicts with keys 'label', 'start', 'end'
+                for function conditioning. Labels can be InterPro IDs (e.g.,
+                'IPR004275') or keywords (e.g., 'antimicrobial peptide').
+                Positions are 1-indexed, inclusive.
+            **kwargs: Passed to BaseWrapper.
         """
         super().__init__(**kwargs)
+        self._function_annotation_dicts = function_annotations
 
         self.model = model
         self.tokenizer = self.model.tokenizers.sequence.vocab
@@ -73,22 +114,28 @@ class WrapperESM3(BaseWrapper):
                     self.preset_fixed_S(fixed_start, fixed_end, fixed_seq) #This will update S, S_msa and decoded positions
 
         if seed_tracks is None: #Other than sequence_tokens
-            '''
-            sequence_tokens (torch.Tensor, optional): The amino acid tokens.
-            structure_tokens (torch.Tensor, optional): The structure tokens.
-            ss8_tokens (torch.Tensor, optional): The secondary structure tokens.
-            sasa_tokens (torch.Tensor, optional): The solvent accessible surface area tokens.
-            function_tokens (torch.Tensor, optional): The function tokens.
-            residue_annotation_tokens (torch.Tensor, optional): The residue annotation tokens.
-            average_plddt (torch.Tensor, optional): The average plddt across the entire sequence.
-            per_res_plddt (torch.Tensor, optional): The per residue plddt, if you want to specify exact plddts, use this,
-                otherwise, use average_plddt.
-            structure_coords (torch.Tensor, optional): The structure coordinates, in the form of (B, L, 3, 3).
-            chain_id (torch.Tensor, optional): The chain ID
-            sequence_id (torch.Tensor, optional): The sequence ID.
-            '''
+            # Build function tokens from annotations if provided
+            function_tokens = None
+            if self._function_annotation_dicts is not None:
+                try:
+                    from esm.utils.types import FunctionAnnotation
+                    annotations = [
+                        FunctionAnnotation(label=a['label'], start=a['start'], end=a['end'])
+                        for a in self._function_annotation_dicts
+                    ]
+                    func_tokenizer = self.model.tokenizers.function
+                    token_strs = func_tokenizer.tokenize(
+                        annotations, seqlen=self.config.length
+                    )
+                    function_tokens = func_tokenizer.encode(
+                        token_strs, add_special_tokens=True
+                    ).unsqueeze(0).to(self.device)  # [1, L+2, depth]
+                except Exception as e:
+                    print(f"Warning: failed to build function tokens: {e}")
+                    function_tokens = None
+
             seed_tracks = { 'structure_tokens': None, 'ss8_tokens': None, 'sasa_tokens': None,
-                            'function_tokens': None, 'residue_annotation_tokens': None,
+                            'function_tokens': function_tokens, 'residue_annotation_tokens': None,
                             'average_plddt': torch.tensor(1.0, device=self.device),
                             'per_res_plddt': torch.ones((1, self.L), device=self.device),
                             'structure_coords': None, 'chain_id': None, 'sequence_id': None }

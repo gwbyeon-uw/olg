@@ -191,25 +191,42 @@ class GuidedWrapper:
         ).item()
 
         for clf, w in zip(self.classifiers, self.weights):
-            # Build one-hot in classifier's token space
-            clf_tokens = clf.encode_tokens(self._inner.S)  # [1, L] in clf space
+            # Map native decoder tokens → OLG alphabet → classifier vocab.
+            # inner.S is in native model space (e.g., EvoDiff 0-30).
+            # alphabet_map_rev maps native → OLG (0-20), with -1 for unmapped.
+            olg_tokens = self._inner.alphabet_map_rev[self._inner.S].clamp(min=0)  # [1, L]
+            clf_tokens = clf.olg_to_clf[olg_tokens]  # [1, L] in clf space
             x_oh = F.one_hot(clf_tokens, clf.vocab_size).float()  # [1, L, V_clf]
+
+            # Handle undecoded positions based on classifier type.
+            decoded = self._inner.decoded_positions[0].bool()  # [L]
+            if hasattr(clf, 'mask_token_idx') and clf.mask_token_idx is not None:
+                # Noisy-trained classifier: use dedicated mask token.
+                # (Spearman ~0.89 vs exact enumeration)
+                x_oh[0, ~decoded, :] = 0.0
+                x_oh[0, ~decoded, clf.mask_token_idx] = 1.0
+            else:
+                # Clean-trained classifier: uniform (1/V) at masked positions.
+                # (Spearman ~0.73 vs exact enumeration)
+                x_oh[0, ~decoded, :] = 1.0 / clf.vocab_size
+
             x_oh = x_oh.detach().requires_grad_(True)
 
-            # Forward
+            # Forward + backward
             log_p = clf.log_prob(x_oh, frac_decoded)  # [B]
-
-            # Backward — gradient w.r.t. one-hot input
             grad = torch.autograd.grad(
                 log_p.sum(), x_oh, create_graph=False
             )[0]  # [1, L, V_clf]
 
+            # Taylor approximation: grad_at_z~ - grad_at_zt
+            # (following discrete_guidance Eq. 10)
+            grad_centered = grad - (x_oh.detach() * grad).sum(dim=-1, keepdim=True)
+
             # Extract gradient at current position
-            grad_t = grad[0, t_msa, :]  # [V_clf]
+            grad_t = grad_centered[0, t_msa, :]  # [V_clf]
 
             # Remap from classifier vocab to OLG alphabet.
             # olg_to_clf[i] = classifier token index for OLG alphabet position i.
-            # So grad at OLG position i = grad at classifier token olg_to_clf[i].
             grad_olg = grad_t[clf.olg_to_clf]  # [olg_alphabet_size]
 
             grad_total[0] += w * grad_olg
