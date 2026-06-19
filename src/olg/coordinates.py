@@ -2,6 +2,7 @@ import torch
 
 from olg.constants import Arrangement
 from olg.config import DesignConfig
+from olg.exceptions import ConfigValidationError
 
 class Coordinates:
     """Manages coordinate transformations between proteins and absolute positions given the design setup"""
@@ -29,6 +30,13 @@ class Coordinates:
         f1_range = range(self.f1_start, self.f1_end)
         f2_range = range(self.f2_start, self.f2_end)
         overlap_range = range(max(f1_range[0], f2_range[0]), min(f1_range[-1], f2_range[-1])+1) #Intersection
+        if len(overlap_range) == 0: #The two frames do not overlap -> not a valid OLG design
+            raise ConfigValidationError(
+                f"Frames do not overlap for arrangement={Arrangement(self.config.arrangement).name} "
+                f"at offset={self.config.offset} (protein lengths "
+                f"{self.config.protein1.length}/{self.config.protein2.length}). "
+                "Choose an offset that produces a non-empty overlap region."
+            )
         overlap_start = overlap_range[0]
         overlap_end = overlap_range[-1] + 1
         
@@ -61,8 +69,8 @@ class Coordinates:
         self.all_to_f2 = torch.zeros(self.total_len, device=self.config.device).long()
         self.all_to_f2.fill_(-1)
         self.all_to_f2[self.f2_start:self.f2_end] = torch.arange(self.f2_end - self.f2_start) + self.config.protein2.start_offset
-        if self.f2_neg: #Invert if negative
-            self.all_to_f2[self.f2_start:self.f2_end] = self.all_to_f2[self.f2_end-1] - self.all_to_f2[self.f2_start:self.f2_end]
+        if self.f2_neg: #Invert if negative (the subtraction cancels start_offset, so add it back to keep f2 coords offset-included)
+            self.all_to_f2[self.f2_start:self.f2_end] = self.all_to_f2[self.f2_end-1] - self.all_to_f2[self.f2_start:self.f2_end] + self.config.protein2.start_offset
 
         self.f1_to_all = torch.stack([ (self.all_to_f1 == pos).nonzero().squeeze(0).squeeze(0) for pos in range(self.config.protein1.start_offset,self.config.protein1.start_offset+self.f1_gap_len+self.config.protein1.force_stop) ])
         self.f2_to_all = torch.stack([ (self.all_to_f2 == pos).nonzero().squeeze(0).squeeze(0) for pos in range(self.config.protein2.start_offset,self.config.protein2.start_offset+self.f2_gap_len+self.config.protein2.force_stop) ])

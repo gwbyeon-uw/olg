@@ -285,13 +285,16 @@ class OLGDesign():
         if self.config.protein2.force_start and (t_f2 == self.config.protein2.start_offset):
             compatibility *= self.compatibility.codon_compatibility_start_mask[1]
         
-        #Fixed position mask
-        fixed_f1 = self.coords.fixed_positions_set[0][t_f1] if t_f1 != -1 else None
-        fixed_f1_prev = self.coords.fixed_positions_set[0][t_f1-1] if (t_f1 > 0) else None
-        fixed_f1_next = self.coords.fixed_positions_set[0][t_f1+1] if 0 < ((t_f1 + 1) < self.coords.f1_gap_len) else None
-        fixed_f2 = self.coords.fixed_positions_set[1][t_f2] if t_f2 != -1 else None
-        fixed_f2_prev = self.coords.fixed_positions_set[1][t_f2-1] if (t_f2 > 0) else None
-        fixed_f2_next = self.coords.fixed_positions_set[1][t_f2+1] if 0 < ((t_f2 + 1) < self.coords.f2_gap_len) else None
+        #Fixed position mask. fixed_positions_set is stored in offset-free (0-based residue)
+        #coordinates, but t_f1/t_f2 are offset-included (= start_offset + residue); convert back.
+        r_f1 = (t_f1 - self.config.protein1.start_offset) if t_f1 != -1 else -1
+        r_f2 = (t_f2 - self.config.protein2.start_offset) if t_f2 != -1 else -1
+        fixed_f1 = self.coords.fixed_positions_set[0][r_f1] if r_f1 != -1 else None
+        fixed_f1_prev = self.coords.fixed_positions_set[0][r_f1-1] if (r_f1 > 0) else None
+        fixed_f1_next = self.coords.fixed_positions_set[0][r_f1+1] if (r_f1 != -1 and (r_f1 + 1) < self.coords.f1_gap_len) else None
+        fixed_f2 = self.coords.fixed_positions_set[1][r_f2] if r_f2 != -1 else None
+        fixed_f2_prev = self.coords.fixed_positions_set[1][r_f2-1] if (r_f2 > 0) else None
+        fixed_f2_next = self.coords.fixed_positions_set[1][r_f2+1] if (r_f2 != -1 and (r_f2 + 1) < self.coords.f2_gap_len) else None
 
         compatibility_safe = compatibility.clone()
         if any(x is not None for x in [fixed_f1, fixed_f1_prev, fixed_f1_next, fixed_f2, fixed_f2_prev, fixed_f2_next]):
@@ -317,6 +320,10 @@ class OLGDesign():
                 quartets_logits_joint = logits_joint_safe.repeat(compatibility_safe.shape[0], 1, 1).unsqueeze(3).repeat(1, 1, 1, Constants.QUARTET_SIZE)
                 quartets_logits_joint[compatibility_safe] = Constants.MIN_LOGIT #Mask joint logits matrix with compatibility matrix
                 masked_logits_joint = torch.clamp(quartets_logits_joint, min=Constants.MIN_LOGIT)
+                if masked_logits_joint.max() == Constants.MIN_LOGIT: #Even the relaxed constraints admit nothing
+                    self.errored_compat = compatibility_safe
+                    self.errored_next_q = self.next_q
+                    raise NoCompatibleQuartetError(self.next_q, "No compatible quartet even with force_safe relaxation")
             else:
                 self.errored_compat = compatibility
                 self.errored_next_q = self.next_q
@@ -327,9 +334,11 @@ class OLGDesign():
         #This implements top-p decoding
         masked_logits_joint_amax = masked_logits_joint.amax([0, 3]) #Collapse to AAs only
         sort_v_, sort_ind = masked_logits_joint_amax.flatten().sort(descending=True) #Sort by logits
-        sort_v = torch.nn.functional.softmax(sort_v_/self.config.temperature, dim=-1) #Apply temperature and softmax
+        temp = self.config.temperature if self.config.temperature > 0 else 1e-8 #avoid div-by-zero NaN; ~0 acts greedy
+        sort_v = torch.nn.functional.softmax(sort_v_/temp, dim=-1) #Apply temperature and softmax
         sort_v_cumsum = sort_v.cumsum(0) #Get cumulative probability of ranked probs for top-P sampling
-        cutoff_ind = torch.nonzero(sort_v_cumsum>self.config.top_p)[0][0] + 1 #Top-P cutoff
+        over_topp = torch.nonzero(sort_v_cumsum>self.config.top_p) #Ranks whose cumprob exceeds top_p
+        cutoff_ind = (over_topp[0][0] + 1) if over_topp.numel() > 0 else sort_v_cumsum.numel() #top_p>=1.0 -> keep all
         topp_v = sort_v[0:cutoff_ind]
         selected = torch.multinomial(topp_v, 1) #Sampling
         
@@ -431,7 +440,9 @@ class OLGDesign():
         for n in range(len(nt_p_1s)):
             if nt_p_1s[n] in nt_qn_1s:
                 acceptable += [ n ]
-        quartet_list[0] = quartet_list[0][torch.randint(len(acceptable), (1,)).item()]
+        if len(acceptable) == 0:
+            raise NoCompatibleQuartetError(0, "string_quartet: no connecting quartet at position 0")
+        quartet_list[0] = quartet_list[0][acceptable[torch.randint(len(acceptable), (1,)).item()]]
 
         #Second to second-last quartet; look to neighboring quartets and choose randomly among the acceptable (connecting) quartets
         for q in range(1, len(quartet_list)-1, 1):
@@ -444,7 +455,9 @@ class OLGDesign():
                 if nt_q_1s[n] == nt_qp_4:
                     if nt_p_1s[n] in nt_qn_1s:
                         acceptable += [ n ]
-            quartet_list[q] = quartet_list[q][torch.randint(len(acceptable), (1,)).item()]
+            if len(acceptable) == 0:
+                raise NoCompatibleQuartetError(q, f"string_quartet: no connecting quartet at position {q}")
+            quartet_list[q] = quartet_list[q][acceptable[torch.randint(len(acceptable), (1,)).item()]]
 
         #last quartet; look to previous quartet and choose randomly among the acceptable (connecting) quartets
         acceptable = []
@@ -453,7 +466,9 @@ class OLGDesign():
         for n in range(len(nt_q_1s)):
             if nt_q_1s[n] == nt_qp_4:
                 acceptable += [ n ]
-        quartet_list[-1] = quartet_list[-1][torch.randint(len(acceptable), (1,)).item()]
+        if len(acceptable) == 0:
+            raise NoCompatibleQuartetError(len(quartet_list) - 1, "string_quartet: no connecting quartet at last position")
+        quartet_list[-1] = quartet_list[-1][acceptable[torch.randint(len(acceptable), (1,)).item()]]
 
         #Trim last nucleotide if in-phase overlap (-0)
         final_nuc = ''.join([ Constants.QUARTETS[q][0:3] for q in quartet_list ] + [ Constants.QUARTETS[quartet_list[-1]][-1] ])
@@ -574,10 +589,13 @@ class OLGDesign():
 
         positions = torch.zeros((2, self.coords.total_len), device=self.config.device)
 
-        f1_abs_position = self.coords.f1_to_all[self.coords.f1_to_all!=(self.coords.f1_to_all.max()+1-(self.config.protein1.force_stop+0))]
+        # The forced-stop codon is always the LAST entry of *_to_all (highest relative
+        # position), regardless of strand. The previous max()-based exclusion dropped the
+        # wrong entry on negative strands (where the stop maps to the smallest abs position).
+        f1_abs_position = self.coords.f1_to_all[:-1] if self.config.protein1.force_stop else self.coords.f1_to_all
         f1_protein_position = self.decoders[0].gap_map_rev[self.decoders[0].gap_map_rev!=-1]
 
-        f2_abs_position = self.coords.f2_to_all[self.coords.f2_to_all!=(self.coords.f2_to_all.max()+1-(self.config.protein2.force_stop+0))]
+        f2_abs_position = self.coords.f2_to_all[:-1] if self.config.protein2.force_stop else self.coords.f2_to_all
         f2_protein_position = self.decoders[1].gap_map_rev[self.decoders[1].gap_map_rev!=-1]
 
         positions[0, f1_abs_position] = f1_score[f1_protein_position]

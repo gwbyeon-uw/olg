@@ -23,8 +23,12 @@ class CodonCompatibility:
         if isinstance(self.codon_table, dict):
             pass  # already a dict, use as-is
         else:
-            self.codon_table = unambiguous_dna_by_name[self.codon_table].forward_table #From Biopython NCBI codes
-            for stop_codon in unambiguous_dna_by_name["Standard"].stop_codons:
+            ncbi_table = unambiguous_dna_by_name[self.codon_table] #From Biopython NCBI codes
+            # copy forward_table (it excludes stops) so we don't mutate Biopython's global,
+            # and use THIS table's own stop codons (Standard's stops are wrong for alt codes,
+            # e.g. mito TGA->W, and miss alt-only stops like AGA/AGG -> KeyError later)
+            self.codon_table = dict(ncbi_table.forward_table)
+            for stop_codon in ncbi_table.stop_codons:
                 self.codon_table[stop_codon] = "X"
         self.codon_table_rev = Constants._reverse_codon_table(self.codon_table)
         self.codon_compatibility, self.quartets_aa = self.generate_compatibility_matrix(
@@ -42,14 +46,15 @@ class CodonCompatibility:
         self.codon_compatibility_start_mask = [None, None]
         self.start_codons_quartets = [[], []]
         if self.config.protein1.force_start:
+            # Allocate the mask ONCE; OR in the quartets of every start codon (not just the last)
+            self.codon_compatibility_start_mask[0] = torch.zeros(self.codon_compatibility.shape, device=self.config.device).int()
             for codon in self.config.protein1.start_codons:
-                self.codon_compatibility_start_mask[0] = torch.zeros(self.codon_compatibility.shape, device=self.config.device).int()
                 for q_i in Constants.CODONS_TO_QUARTETS[Constants.CODONS.index(codon)][Constants.FRAME_F1[self.config.arrangement]]:
                     self.codon_compatibility_start_mask[0][:, :, :, :, :, q_i] = 1
                     self.start_codons_quartets[0] += [ q_i ]
         if self.config.protein2.force_start:
+            self.codon_compatibility_start_mask[1] = torch.zeros(self.codon_compatibility.shape, device=self.config.device).int()
             for codon in self.config.protein2.start_codons:
-                self.codon_compatibility_start_mask[1] = torch.zeros(self.codon_compatibility.shape, device=self.config.device).int()
                 for q_i in Constants.CODONS_TO_QUARTETS[Constants.CODONS.index(codon)][Constants.FRAME_F2[self.config.arrangement]]:
                     self.codon_compatibility_start_mask[1][:, :, :, :, :, q_i] = 1
                     self.start_codons_quartets[1] += [ q_i ]

@@ -402,13 +402,18 @@ def rand_massey_2_3_shuffler(blocks, parents, fixed_aas = None, seed = 0):
 
     return code
 
-standard_code_ = read_code("data/code_standard.tsv")
-standard_code = {}
-for k,v in standard_code_.items():
-    if v != '*':
-        standard_code[k] = v
-    else:
-        standard_code[k] = stop_letter
+# Resolve relative to this file (not the CWD) and fall back to Biopython when the data
+# file is not shipped, so importing this module never depends on the working directory.
+_standard_code_path = Path(__file__).resolve().parent / "data" / "code_standard.tsv"
+if _standard_code_path.exists():
+    standard_code_ = read_code(str(_standard_code_path))
+    standard_code = {k: (v if v != '*' else stop_letter) for k, v in standard_code_.items()}
+else:
+    from Bio.Data.CodonTable import unambiguous_dna_by_name
+    _std_table = unambiguous_dna_by_name["Standard"]
+    standard_code = dict(_std_table.forward_table)
+    for _stop in _std_table.stop_codons:
+        standard_code[_stop] = stop_letter
 
 # maximum difference between number of codons per aa in the alternative codes and the standard one
 # only used when randomization_type = "aa_permutation_restricted"
