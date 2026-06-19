@@ -9,6 +9,7 @@ import torch
 import yaml
 
 from olg.constants import *
+from olg.exceptions import ConfigValidationError
 
 _BASE_YAML = Path(__file__).parent / "base.yaml"
 
@@ -40,7 +41,7 @@ def _resolve_tensor(value: Any, device: torch.device) -> torch.Tensor:
             return torch.load(p, map_location=device, weights_only=True)
         if p.suffix in (".npy", ".npz"):
             return torch.from_numpy(np.load(p)).to(device)
-        raise ValueError(f"Unsupported tensor file format: {p.suffix}")
+        raise ConfigValidationError(f"Unsupported tensor file format: {p.suffix}")
     raise TypeError(f"Cannot convert {type(value).__name__} to tensor")
 
 
@@ -80,13 +81,66 @@ class ProteinConfig:
 
     def _validate(self):
         if self.length <= 0:
-            raise ValueError(f"length must be positive, got {self.length}")
+            raise ConfigValidationError(f"length must be positive, got {self.length}")
         if self.repetition_penalty < 1.0:
-            raise ValueError(f"repetition_penalty must be >= 1.0, got {self.repetition_penalty}")
+            raise ConfigValidationError(f"repetition_penalty must be >= 1.0, got {self.repetition_penalty}")
         if self.repetition_penalty_window < 0:
-            raise ValueError(f"repetition_penalty_window must be >= 0, got {self.repetition_penalty_window}")
+            raise ConfigValidationError(f"repetition_penalty_window must be >= 0, got {self.repetition_penalty_window}")
         if not (0.0 <= self.truncate_topp <= 1.0):
-            raise ValueError(f"truncate_topp must be in [0, 1], got {self.truncate_topp}")
+            raise ConfigValidationError(f"truncate_topp must be in [0, 1], got {self.truncate_topp}")
+
+        # start_offset: consumed by coordinate maps (all_to_f1 = arange(...) + start_offset)
+        # and get_prot_seq slicing; must index validly into a length-`length` protein.
+        if not (0 <= self.start_offset < self.length):
+            raise ConfigValidationError(
+                f"start_offset must be in [0, length={self.length}), got {self.start_offset}")
+
+        # start codons must be DNA triplets (looked up in CODONS_TO_QUARTETS by exact match)
+        for codon in self.start_codons:
+            if not (isinstance(codon, str) and len(codon) == 3 and all(b in "ACGT" for b in codon)):
+                raise ConfigValidationError(
+                    f"start_codons must be length-3 strings over ACGT, got {codon!r}")
+
+        # fixed_positions are 1-based, must lie in [1, length], and be unique
+        if self.fixed_positions is not None:
+            seen = set()
+            for fp in self.fixed_positions:
+                pos = fp[0]
+                if not (1 <= pos <= self.length):
+                    raise ConfigValidationError(
+                        f"fixed_positions position {pos} out of range [1, {self.length}]")
+                if pos in seen:
+                    raise ConfigValidationError(f"duplicate fixed_positions position {pos}")
+                seen.add(pos)
+
+        # gap_positions: 1-based, in [1, length], unique, and cannot remove every residue
+        # (coordinates.py computes f1_gap_len = length - len(gap_positions))
+        if self.gap_positions is not None:
+            if len(set(self.gap_positions)) != len(self.gap_positions):
+                raise ConfigValidationError("gap_positions contains duplicate entries")
+            for g in self.gap_positions:
+                if not (1 <= g <= self.length):
+                    raise ConfigValidationError(
+                        f"gap_positions entry {g} out of range [1, {self.length}]")
+            if len(self.gap_positions) >= self.length:
+                raise ConfigValidationError(
+                    f"gap_positions removes all residues ({len(self.gap_positions)} >= length {self.length})")
+
+        # User-supplied tensor shapes must match (length, alphabet_size) couplings.
+        # Defaults are filled in after _validate, so only non-None (user) tensors are checked.
+        # _validate runs at this config's own alphabet_size; DesignConfig._resize_for_alphabet
+        # legitimately extends tensors later only when pc.alphabet_size < design.alphabet_size.
+        expected = {
+            "logit_weight": (self.length,),
+            "logit_bias": (self.length, self.alphabet_size),
+            "aa_bias": (self.alphabet_size,),
+            "max_aa_count": (self.alphabet_size,),
+        }
+        for name, shape in expected.items():
+            val = getattr(self, name)
+            if val is not None and tuple(val.shape) != shape:
+                raise ConfigValidationError(
+                    f"{name} must have shape {shape}, got {tuple(val.shape)}")
 
     @classmethod
     def _from_dict(cls, d: dict, device: torch.device, alphabet_size: int = Constants.DEFAULT_ALPHABET_SIZE) -> ProteinConfig:
@@ -119,6 +173,10 @@ class ProteinConfig:
                 if not include_defaults and self._is_default_tensor(f.name, val):
                     continue
                 d[f.name] = val.cpu().tolist()
+            elif f.name == "fixed_positions" and val is not None:
+                # store as plain lists, not tuples, so yaml.safe_load can round-trip them
+                # (tuples serialize as !!python/tuple tags that safe_load rejects)
+                d[f.name] = [list(fp) for fp in val]
             else:
                 d[f.name] = val
         return d
@@ -185,17 +243,17 @@ class DesignConfig:
         self.alphabet_size: int = len(self.alphabet)
         self.alphabet_index: Dict[str, int] = {a: i for i, a in enumerate(self.alphabet)}
         if 'X' not in self.alphabet_index:
-            raise ValueError("alphabet must contain 'X' (stop codon marker)")
+            raise ConfigValidationError("alphabet must contain 'X' (stop codon marker)")
         self.stop_index: int = self.alphabet_index['X']
         # Validate no duplicates
         if self.alphabet_size != len(set(self.alphabet)):
             dupes = sorted({a for a in self.alphabet if self.alphabet.count(a) > 1})
-            raise ValueError(f"alphabet contains duplicate letters: {dupes}")
+            raise ConfigValidationError(f"alphabet contains duplicate letters: {dupes}")
         # Validate codon_table values are all in alphabet
         if isinstance(self.codon_table, dict):
             unknown = set(self.codon_table.values()) - set(self.alphabet)
             if unknown:
-                raise ValueError(
+                raise ConfigValidationError(
                     f"codon_table references amino acids not in alphabet: {sorted(unknown)}. "
                     f"Extend DesignConfig.alphabet to include them."
                 )
@@ -205,7 +263,7 @@ class DesignConfig:
             if pc.alphabet_size < self.alphabet_size:
                 pc._resize_for_alphabet(self.alphabet_size)
             elif pc.alphabet_size > self.alphabet_size:
-                raise ValueError(
+                raise ConfigValidationError(
                     f"ProteinConfig.alphabet_size ({pc.alphabet_size}) exceeds "
                     f"DesignConfig.alphabet_size ({self.alphabet_size}). "
                     f"Ensure ProteinConfigs are built with the same alphabet as DesignConfig."
@@ -270,7 +328,9 @@ class DesignConfig:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
-            yaml.dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)
+            # safe_dump (vs dump) refuses to emit python-specific tags, so any non-plain
+            # value surfaces as an error at write time instead of breaking safe_load on read
+            yaml.safe_dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)
 
     def to_dict(self) -> dict:
         """Serialize to a plain dict. Tensors become lists, enums become ints."""
