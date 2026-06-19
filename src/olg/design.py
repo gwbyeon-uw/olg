@@ -480,19 +480,26 @@ class OLGDesign():
         f2_prot = self.decoders[1].get_prot_seq()
         return f1_prot, f2_prot
 
-    def translate_sequences(self) -> Tuple[str, str]:
+    def translate_sequences(self, nt_seq: Optional[str] = None) -> Tuple[str, str]:
         """Translate both proteins from the NT sequence using the configured codon table.
 
         Independent of model wrapper vocabularies — correctly handles extended
         alphabets (e.g. S/J serine split) and all frame arrangements, including
-        reverse-strand proteins.  Calls ``string_quartet()`` internally to
-        materialise the current NT sequence.  Stop codons terminate each
-        sequence and are not included in the output.
+        reverse-strand proteins.  Stop codons terminate each sequence and are not
+        included in the output.
+
+        Args:
+            nt_seq: NT sequence to translate. If None, ``string_quartet()`` is called
+                to materialise one. ``string_quartet()`` makes a random choice among
+                synonymous quartets, so pass an explicit ``nt_seq`` (e.g. from a single
+                ``string_quartet()`` call) when the translation must match a specific
+                emitted NT string.
 
         Returns:
             Tuple of (protein1_seq, protein2_seq) as amino acid strings.
         """
-        nt_seq, _ = self.string_quartet()
+        if nt_seq is None:
+            nt_seq, _ = self.string_quartet()
         codon_table = self.compatibility.codon_table  # resolved dict (NCBI name expanded)
         f1_offset, f2_offset, f2_reverse = Constants.ARRANGEMENT_CONFIG[int(self.config.arrangement)]
 

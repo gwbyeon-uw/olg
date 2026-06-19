@@ -101,14 +101,19 @@ class ProteinConfig:
                 raise ConfigValidationError(
                     f"start_codons must be length-3 strings over ACGT, got {codon!r}")
 
-        # fixed_positions are 1-based, must lie in [1, length], and be unique
+        # fixed_positions are 1-based in the gap-reduced residue space and must be unique.
+        # coordinates.py indexes f1_to_all[pos-1], and f1_to_all has (length - len(gap_positions))
+        # entries, so the bound is the post-gap residue count, not raw length.
         if self.fixed_positions is not None:
+            n_gaps = len(self.gap_positions) if self.gap_positions else 0
+            effective_len = self.length - n_gaps
             seen = set()
             for fp in self.fixed_positions:
                 pos = fp[0]
-                if not (1 <= pos <= self.length):
+                if not (1 <= pos <= effective_len):
                     raise ConfigValidationError(
-                        f"fixed_positions position {pos} out of range [1, {self.length}]")
+                        f"fixed_positions position {pos} out of range [1, {effective_len}] "
+                        f"(length {self.length} minus {n_gaps} gap positions)")
                 if pos in seen:
                     raise ConfigValidationError(f"duplicate fixed_positions position {pos}")
                 seen.add(pos)

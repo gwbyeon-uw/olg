@@ -98,9 +98,11 @@ def run_one(arrangement: Arrangement, offset: int, seed: int) -> dict:
     except Exception as e:
         return {"status": "DECODE-FAIL", "detail": f"{type(e).__name__}: {e}"}
 
+    # string_quartet() randomly picks among synonymous quartets, so materialise the NT
+    # ONCE and translate that exact string through both the olg and Biopython legs.
     nt, _ = olg.string_quartet()
-    t1, t2 = olg.translate_sequences()  # olg's translation of emitted NT
-    g1, g2 = olg.get_prot_seq()         # decoder-held tokens
+    t1, t2 = olg.translate_sequences(nt_seq=nt)  # olg's translation of THIS NT
+    g1, g2 = olg.get_prot_seq()                  # decoder-held tokens
 
     # External Biopython translation of the same NT, per frame geometry
     f1_off, f2_off, f2_rev = Constants.ARRANGEMENT_CONFIG[int(arrangement)]

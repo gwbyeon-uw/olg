@@ -278,7 +278,7 @@ class WrapperEvoDiff(BaseWrapper):
                 if self.use_esm_msa:
                     remapped_input = torch.nn.functional.pad(torch.gather(self.remap_to_esmmsa.expand(self.S_msa.shape[1], -1), 1, self.S_msa[0]), (1, 0)).unsqueeze(0)
                     output_ = self.model(remapped_input)  #Output shape of preds is (BS=1, N=64, L, n_tokens=31)
-                    output = torch.zeros((1, self.S_msa.shape[1], self.S_msa.shape[2], len(self.tokenizer.a_to_i)), device=self.device).fill_(MIN_LOGIT)
+                    output = torch.zeros((1, self.S_msa.shape[1], self.S_msa.shape[2], len(self.tokenizer.a_to_i)), device=self.device).fill_(Constants.MIN_LOGIT)
                     output[:, :, :, self.remap_to_evodiff[self.remap_to_evodiff!=-1]] = output_['logits'][:, :, 1:, self.remap_to_evodiff!=-1]
                     self.current_pred = output[0, 0, :, :]
                 else:
