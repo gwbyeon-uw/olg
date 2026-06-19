@@ -142,19 +142,35 @@ class GuidedWrapper:
         if dummy_run or not self.classifiers:
             return base_logits, base_logits_
 
+        # At a forced-stop step the inner decoder returns the stop vector and does NOT
+        # update current_logits; computing/adding a TAG gradient there is meaningless, so
+        # pass the base (forced-stop) logits through unchanged.
+        if getattr(self._inner.config, "force_stop", False):
+            t_pos = self._inner.decoding_order[0, self._inner.next_t]
+            if t_pos == self._inner.end_pos:
+                return base_logits, base_logits_
+
         grad_olg = self._compute_tag_gradient()
 
         # Effective temperature with warmup
         temp = self.guide_temp
         if self.warmup > 0:
-            frac = self._inner.decoded_positions.sum() / max(
-                self._inner.decoded_positions.numel(), 1
-            )
+            frac = self._frac_decoded()
             temp = temp * (1.0 + self.warmup * (1.0 - frac))
 
         guided = base_logits + grad_olg / temp
         guided_ = base_logits_ + grad_olg / temp
         return guided, guided_
+
+    def _frac_decoded(self) -> torch.Tensor:
+        """Fraction of real positions decoded so far.
+
+        Denominator is the number of decodable positions (decoding_order length),
+        NOT decoded_positions.numel(): MSA wrappers pad decoded_positions with
+        never-decoded pad slots, which would otherwise keep this below 1.0.
+        """
+        n_real = self._inner.decoding_order.shape[1]
+        return self._inner.decoded_positions.sum() / max(n_real, 1)
 
     def _compute_tag_gradient(self) -> torch.Tensor:
         """Compute TAG gradient at the current decoding position.
@@ -184,11 +200,8 @@ class GuidedWrapper:
         olg_alphabet_size = self._inner.alphabet_size
         grad_total = torch.zeros((1, olg_alphabet_size), device=self._inner.S.device)
 
-        # Fraction decoded for time conditioning
-        frac_decoded = (
-            self._inner.decoded_positions.sum()
-            / max(self._inner.decoded_positions.numel(), 1)
-        ).item()
+        # Fraction decoded for time conditioning (real positions only; see _frac_decoded)
+        frac_decoded = self._frac_decoded().item()
 
         for clf, w in zip(self.classifiers, self.weights):
             # Map native decoder tokens → OLG alphabet → classifier vocab.

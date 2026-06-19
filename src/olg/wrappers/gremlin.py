@@ -5,7 +5,6 @@ import numpy as np
 import torch
 
 from olg.constants import *
-from olg.config import ProteinConfig
 
 from .base_wrapper import BaseWrapper
 
@@ -60,7 +59,7 @@ class WrapperGREMLIN(BaseWrapper):
         self,
         model: torch.nn.Module,
         temperature: float = 1.0,
-        prefixed_seq: Optional[Tuple[int, int, str]] = None,
+        prefixed_seq: Optional[List[Tuple[int, int, str]]] = None,
         extra_aa_map: Optional[dict[str, str]] = None,
         **kwargs
     ):
@@ -242,7 +241,9 @@ class WrapperGREMLIN(BaseWrapper):
             self.reset(self.decoding_order, self.rand_base, S)
             self.decode_all(use_S=S[0]) 
             if positions is not None:
-                return (self.selected_log_prob.mean() * -1.0)[0, positions]
+                # index the per-position scores first, THEN average (mirror proteinmpnn.get_score);
+                # the previous order reduced to a scalar before indexing -> IndexError
+                return (self.selected_log_prob * -1.0)[0, positions].mean()
             return self.selected_log_prob.mean() * -1.0
         
     def get_prot_seq(self, S=None):

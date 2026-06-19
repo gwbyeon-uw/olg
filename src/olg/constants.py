@@ -159,8 +159,7 @@ class Constants:
     
     STANDARD_CODONS_REV = _reverse_codon_table(STANDARD_CODONS)
     
-    EVODIFF_ALPHABET = { c: i for i, c in enumerate(list('ACDEFGHIKLMNPQRSTVWYBZXJOU-*#@!')) }
-    EVODIFF_ALPHABET_INDEX = { u: i for i, u in enumerate(EVODIFF_ALPHABET) }
+    EVODIFF_ALPHABET = { c: i for i, c in enumerate(list('ACDEFGHIKLMNPQRSTVWYBZXJOU-*#@!')) }  # letter -> index
 
     ESM_MSA_ALPHABET = list('@!*uLAGVSERTIDPKQNFYMHWCXBUZO.-n#') # @: start token <cls>, !: pad token <pad>, *: stop token <eos>, -: gap token, #: mask token <mask>
     ESM_MSA_ALPHABET[3] = '<unk>'

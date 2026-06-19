@@ -119,6 +119,10 @@ class WrapperMSAPairformer(BaseWrapper):
         self.seq_len = self.model_len + self.pad_n + self.pad_c  # OLG-visible length
         self.msa_selection_type = msa_selection_type
 
+        # Seed numpy's global RNG from rand_base so MSA subsampling is reproducible
+        # (subsample_msa uses np.random.choice for the slice window and sequence selection)
+        if self.rand_base is not None:
+            np.random.seed(int(self.rand_base))
         self.valid_msa_, self.query_sequence, _ = self.subsample_msa(
             self.msa_seqs,
             n_sequences=self.msa_n_seq,

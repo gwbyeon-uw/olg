@@ -8,7 +8,7 @@ import numpy as np
 from olg.constants import *
 from olg.config import ProteinConfig
 
-from ._vendored.protein_mpnn_utils import gather_nodes, cat_neighbors_nodes, _scores, parse_PDB, StructureDatasetPDB, ProteinMPNN
+from ._vendored.protein_mpnn_utils import gather_nodes, cat_neighbors_nodes, parse_PDB, StructureDatasetPDB, ProteinMPNN
 from .base_wrapper import BaseWrapper
 
 class WrapperProteinMPNN(BaseWrapper):
@@ -467,11 +467,6 @@ class WrapperProteinMPNN(BaseWrapper):
         self.argmax_aa = torch.zeros(self.decoding_order_target.shape[1], device=self.device).unsqueeze(0).long() #This will keep track of AAs that would have been the argmax
         
         self.preset_fixed_S(self.fixed_chain_seq) #This will update S, h_S and decoded_positions with fixed chains; but not individual fixed positions within design chains
-        
-        self.mask_eval = (~self.decoded_positions.bool()).to(torch.float32) #Mask for fixed chain / positions; used to get log probs only over the designed regions
-        fixed_chain_res = torch.nonzero(self.fixed_positions != -1)
-        if fixed_chain_res.shape[0] > 0:
-            self.mask_eval[0, fixed_chain_res] = 0.0
 
     def _get_decoding_mask(
         self, 
@@ -701,8 +696,10 @@ class WrapperProteinMPNN(BaseWrapper):
             count_pos[:, self.target_chain_offset:(self.target_chain_offset+self.target_chain_length)] = 1
             count_pos = (self.decoded_positions * count_pos) == 1
 
-            # aa_count in OLG-internal space (S stores native tokens, new-letter slots are zero)
-            aa_count = torch.nn.functional.one_hot(self.S[:,count_pos[0]], num_classes=self.alphabet_size).sum(1)
+            # aa_count in OLG-internal space: S stores NATIVE tokens, so map them to OLG indices
+            # before counting (max_aa_count / pos_charged_indices are OLG-indexed). Without the
+            # remap this is only correct when the OLG alphabet matches the native vocab 1:1.
+            aa_count = torch.nn.functional.one_hot(self.alphabet_map_rev[self.S[:,count_pos[0]]], num_classes=self.alphabet_size).sum(1)
             max_aa = (aa_count >= self.config.max_aa_count)
             logits[max_aa] = Constants.MIN_LOGIT
 
@@ -835,82 +832,33 @@ class WrapperProteinMPNN(BaseWrapper):
         self.log_prob[t_local, :] = log_softmax
         self.argmax_aa[:, t_local] = self.current_logits[0].argmax()
         
-    def get_likelihoods(
-        self, 
-        S: Optional[torch.Tensor] = None, 
-        decoding_order: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        From ProteinMPNN; compute the log probability distribution over amino acids for each position in the sequence.
-        
-        Args:
-            S: Optional sequence tensor to evaluate. If None, uses self.S
-            decoding_order: Optional custom decoding order. If None, uses self.decoding_order_S
-        
-        Returns:
-            torch.Tensor: Log probability tensor of shape [batch, length, alphabet_size]
-                containing log probabilities for each amino acid at each position
-        
-        Side Effects:
-            - Updates self.log_prob with the computed log probabilities
-            - Updates self.selected_log_prob with negative log likelihood of the sequence
-            - Sets all positions in self.decoded_positions as decoded after this operation
-        """
-        if S is None:
-            S = self.S
-        if decoding_order is None:
-            decoding_order = self.decoding_order_S
-        randn = torch.rand(self.mask.shape, device=self.device)  #This is a dummy parameter, using specified decoding order
-        
-        log_probs = self.model(self.X, S, self.mask, self.mask_eval, self.residue_idx, self.chain_encoding+1, randn, use_input_decoding_order=True, decoding_order=decoding_order)
-        self.log_prob = log_probs[0]
-        #self.argmax_aa = self.log_prob.argmax()
-        criterion = torch.nn.NLLLoss(reduction='none')
-        self.selected_log_prob = criterion(log_probs.contiguous().view(-1,log_probs.size(-1)),S.contiguous().view(-1)).view(S.size())
-        self.decoded_positions.fill_(1.0)
-            
-        return log_probs
-    
     def get_score(
-        self, 
-        S: Optional[torch.Tensor] = None, 
-        ar_ll: bool = False, 
-        decoding_order: Optional[torch.Tensor] = None, 
+        self,
+        S: Optional[torch.Tensor] = None,
         positions: Optional[torch.Tensor] = None
     ) -> float:
         """
-        Calculate the log likelihood score for a protein sequence.
-        
+        Calculate the pseudo-likelihood score for a protein sequence.
+
+        Each position is masked in turn and scored by its conditional log-prob
+        given the rest of the sequence.
+
         Args:
-            S: Optional sequence tensor to score. If None, uses current sequence (self.S)
-                To rescore current sequence, pass self.S.clone() explicitly
-            ar_ll: If True, uses autoregressive log likelihood computation from ProteinMPNN utils
-                if False, uses pseudolikelihood (mask each position, get conditional prob on rest of seq)
-            decoding_order: Optional custom decoding order for ar_ll mode.
-                If None, uses self.decoding_order_S
-            positions: Optional tensor of specific positions to score.
-                If provided, only these positions contribute to the score
-        
+            S: Optional sequence tensor to score. If None, uses the current sequence (self.S).
+                To rescore the current sequence, pass self.S.clone() explicitly.
+            positions: Optional tensor of target-relative positions to score.
+                If provided, only these positions contribute to the score.
+
         Returns:
-            float: Negative log likelihood score; lower = better
+            float: Negative log likelihood score; lower = better.
         """
         if S is None: #To rescore with current sequence, use self.S.clone() as input
             S = self.S.clone()
-            
-        if not ar_ll:
-            self.reset(self.decoding_order, self.rand_base, S)
-            self.decode_all(use_S=S[0], mask_current=True)
-            if positions is not None:
-                return (self.selected_log_prob * -1.0)[0, positions].mean()
-            return (self.selected_log_prob.mean() * -1.0)
-        else:
-            if decoding_order is None:
-                decoding_order = self.decoding_order_S
-            log_probs = self.get_likelihoods(S, decoding_order)
-            mask_for_loss = self.mask * self.mask_eval
-            if positions is not None:
-                mask_for_loss[positions] = 0
-            return _scores(S, log_probs, mask_for_loss)[0]
+        self.reset(self.decoding_order, self.rand_base, S)
+        self.decode_all(use_S=S[0], mask_current=True)
+        if positions is not None:
+            return (self.selected_log_prob * -1.0)[0, positions].mean()
+        return (self.selected_log_prob.mean() * -1.0)
 
     def get_prot_seq(self, S: Optional[torch.Tensor] = None) -> Optional[str]:
         if S is None:
@@ -951,8 +899,10 @@ class WrapperProteinMPNN(BaseWrapper):
             else:
                 t = self.decoding_order[:, i]
                 if not (self.config.force_stop and (t == self.end_pos)):
-                    # use_S stores native tokens; convert to OLG-internal for update_S
-                    S_t = self.alphabet_map_rev[use_S[t]]
+                    # use_S stores native tokens; convert to OLG-internal for update_S.
+                    # t is target-relative; use_S is the model-global sequence, so shift by the
+                    # target chain's offset (no-op for single-chain designs).
+                    S_t = self.alphabet_map_rev[use_S[t + self.target_chain_offset]]
                 else:
                     S_t = None
             self.update_S(S_t, alphabet_map=False)

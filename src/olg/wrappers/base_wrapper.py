@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 import numpy.typing as npt
 from scipy.spatial.distance import squareform
+from tqdm import tqdm
 
 from olg.constants import *
 from olg.config import ProteinConfig
@@ -138,6 +139,9 @@ class BaseWrapper:
             decoded_pos = self.decoded_positions[0, t_left:(t_right+1)].bool()
             if decoded_pos.sum() > 0:
                 neighbor_aa = self.alphabet_map_rev[self.S[0, t_left:(t_right+1)][decoded_pos]]
+                # drop tokens with no OLG-alphabet mapping (-1, e.g. gaps); a -1 would index
+                # logits[0, -1] and penalize the last token (X/stop) instead of being skipped
+                neighbor_aa = neighbor_aa[neighbor_aa >= 0]
                 uniq_ct = torch.unique(neighbor_aa, return_counts=True)
                 if neighbor_aa.shape[0] > 0:
                     logits_p = logits[0, uniq_ct[0]]
@@ -209,6 +213,8 @@ class BaseWrapper:
         lines = open(filename, "r")
         for line in lines:
             line = line.rstrip()
+            if not line:  # skip blank lines (trailing newline / separators) to avoid line[0] IndexError
+                continue
             if line[0] == ">":
                 if len(header) == limit:
                     break
@@ -298,7 +304,17 @@ class BaseWrapper:
                 "ncol":ncol,
                 "ncol_ori":msa_ori.shape[1],
                 "states":states}
-        
+
+    def get_tied_positions(self) -> list[int]:
+        """Positions to update together with the current decode step.
+
+        Default: the current position only. Subclasses that support tied/symmetric
+        decoding (e.g. ProteinMPNN multimer) override this. Lives on BaseWrapper so
+        every wrapper satisfies DecoderProtocol, including in complexed designs.
+        """
+        t = self.decoding_order[0, self.next_t]
+        return [t.item()]
+
 class ZeroOrderWrapper(BaseWrapper):
     """
     Zero order model for testing / decoding order initialization purposes
@@ -453,15 +469,6 @@ class ZeroOrderWrapper(BaseWrapper):
             S = self.alphabet_map_rev[self.S[0, self.config.start_offset:self.config.length]]
         prot = ''.join([self.alphabet[s] for s in S])
         return prot
-
-    def get_tied_positions(self) -> list[int]:
-        """Positions to update together with current decode step.
-
-        Default: current position only. Override in subclasses that support
-        tied/symmetric decoding (e.g. ProteinMPNN multimer).
-        """
-        t = self.decoding_order[0, self.next_t]
-        return [t.item()]
 
     def decode_all(
         self, 

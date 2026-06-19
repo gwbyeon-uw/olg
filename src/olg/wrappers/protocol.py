@@ -32,8 +32,11 @@ class DecoderProtocol(Protocol):
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
     def update_S(
-        self, S_t: torch.Tensor, dummy_run: bool = False, use_t: int | None = None, alphabet_map: bool = True
-    ) -> bool: ...
+        self, S_t: torch.Tensor, use_t: int | None = None, alphabet_map: bool = True, dummy_run: bool = False
+    ) -> bool:
+        # MSA-family wrappers (evodiff, evodiff_seq, gremlin) insert a leading `use_t_msa`
+        # arg before `use_t`; `dummy_run` is always last. Call with keywords to be safe.
+        ...
 
     def edit_S(
         self, t: int, S_t: torch.Tensor, inplace: bool = False

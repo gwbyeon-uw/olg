@@ -5,9 +5,9 @@ from typing import Tuple, List, Union, Literal, Optional
 import torch
 import numpy as np
 import numpy.typing as npt
+from scipy.spatial.distance import cdist
 
 from olg.constants import *
-from olg.config import ProteinConfig
 
 from evodiff.utils import Tokenizer
 from evodiff.pretrained import MSA_OA_DM_MAXSUB, ESM_MSA_1b #https://github.com/microsoft/evodiff/tree/main#loading-pretrained-models
@@ -27,7 +27,7 @@ class WrapperEvoDiff(BaseWrapper):
         msa_max_length: int,
         msa_selection_type: Literal['random', 'MaxHamming', 'MaxHammingI'] = 'random',
         use_esm_msa: bool = False,
-        prefixed_seq: Optional[Tuple[int, int, str]] = None,
+        prefixed_seq: Optional[List[Tuple[int, int, str]]] = None,
         extra_aa_map: Optional[dict[str, str]] = None,
         **kwargs
     ):
@@ -46,6 +46,10 @@ class WrapperEvoDiff(BaseWrapper):
         self.seq_len = self.msa_max_length #Set to same as MSA length for now
         self.msa_selection_type = msa_selection_type # or 'MaxHamming'; MSA subsampling scheme
 
+        # Seed numpy's global RNG from rand_base so MSA subsampling is reproducible
+        # (subsample_msa uses np.random.choice for the slice window and sequence selection)
+        if self.rand_base is not None:
+            np.random.seed(int(self.rand_base))
         self.valid_msa_, self.query_sequence, _ = self.subsample_msa(
             self.msa_seqs, 
             n_sequences=self.msa_n_seq,
@@ -101,7 +105,7 @@ class WrapperEvoDiff(BaseWrapper):
     def tokenizeMSA(
         seq: Union[str, List[str]]
     ) -> npt.NDArray[np.int_]:
-        return np.array([Constants.EVODIFF_ALPHABET_INDEX[a] for a in seq])
+        return np.array([Constants.EVODIFF_ALPHABET[a] for a in seq])
     
     @staticmethod
     def subsample_msa(
@@ -134,8 +138,8 @@ class WrapperEvoDiff(BaseWrapper):
         """    
         alphabet = Constants.EVODIFF_ALPHABET #EvoDiff alphabet
         alpha = np.array(list(alphabet))
-        gap_idx = Constants.EVODIFF_ALPHABET_INDEX['-']
-        pad_idx = Constants.EVODIFF_ALPHABET_INDEX['!']
+        gap_idx = Constants.EVODIFF_ALPHABET['-']
+        pad_idx = Constants.EVODIFF_ALPHABET['!']
         
         #Do hamming distance from aligned section
         aligned_msa = [ [ char for char in seq if (char.isupper() or char == '-') and not char == '.' ] for seq in parsed_msa ]   
