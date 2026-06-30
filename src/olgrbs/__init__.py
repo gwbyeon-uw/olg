@@ -2,7 +2,7 @@
 
 Consumes olg's native ``OLGDesign`` output and optimizes the inner gene's ribosome
 binding site under the outer-protein-synonymous (and dual-synonymous overlap)
-constraints, scored with OSTIR. See IMPLEMENTATION_PLAN.md.
+constraints, scored with OSTIR.
 """
 from .driver import Candidate, RBSResult, optimize_rbs
 from .scorer import ECOLI_ANTI_SD, RBSScore, score_rbs
