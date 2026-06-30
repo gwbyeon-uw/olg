@@ -210,6 +210,42 @@ class OLGCampaign:
         olg.decode_all(dummy_run=(False, False), mask_current=(False, False), force_safe=False, retry=80)
         return olg
 
+    # ── realize a design into actual sequences (protein + nucleotide, downstream-useful forms) ──
+    def sequences(self, arr, off, amp_seq, mut_aa, *, final_nt=None, rbs_opt=None, seed=0, device=None) -> dict:
+        """Realize a design's actual sequences from the final RBS-optimized DNA. Pass `final_nt` (the scan's
+        stored `rbs_nt`) to extract directly; if omitted, the RBS optimization is re-run (slow, but
+        deterministic at `seed`) to recover it. Returns:
+
+          full_dna        the complete designed inner-gene CDS (FabD, RBS-optimized) -- the orderable construct
+          fabd_protein    the gene-frame translation (FabD + co-design mutations)
+          amp_protein     the AMP peptide (Met + interior)
+          amp_cds         the nested AMP ORF nucleotides (ATG ... stop)
+          rbs_upstream    ~30 nt 5' of the AMP start (the SD/spacer the RBS optimization tuned)
+          rbs_fold_window the exact slice OSTIR scores (+ rbs_start_in_window) -- reproduces rbs_rate
+        """
+        from olgrbs import optimize_rbs, rbs_window, score_rbs
+        device = device or torch.device("cpu")
+        olg = self.reconstruct(arr, off, amp_seq, mut_aa, device)
+        if final_nt is None:                                       # no stored DNA -> re-run the RBS optimization
+            res = optimize_rbs(olg, seed=seed, **dict(rbs_opt or self.cfg.scan_cfg()["rbs_opt"]))
+            final_nt = res.best.nt if res.best else olg.string_quartet()[0]
+        fabd_protein, amp_protein = olg.translate_sequences(final_nt)
+        s = rbs_window(olg).inner_start_nt                          # AMP ATG index in the DNA
+        lo = max(0, s - 40)                                        # OSTIR fold window start (driver's _FOLD_MARGIN)
+        sc = score_rbs(final_nt[lo:s + 43], s - lo)               # cheap re-score of the final RBS (one OSTIR call)
+        return {
+            "arrangement": Arrangement(arr).name, "offset": int(off), "length": len(amp_protein),
+            "fabd_protein": fabd_protein, "amp_protein": amp_protein,
+            "full_dna": final_nt,
+            "amp_cds": final_nt[s:s + 3 * (len(amp_protein) + 1)],  # Met + interior + stop
+            "amp_start_nt": s,
+            "rbs_upstream": final_nt[max(0, s - 30):s],
+            "rbs_fold_window": final_nt[lo:s + 43], "rbs_start_in_window": s - lo,
+            "rbs_rate": round(sc.expression, 1) if sc else None,
+            "rbs_pctile": round(self.ecoli_percentile()(sc.expression), 1) if sc else None,
+            "n_gene_mut": len(mut_aa.split(";")) if isinstance(mut_aa, str) and mut_aa else 0,
+        }
+
     # ── E. coli RBS percentile ──
     def ecoli_percentile(self):
         """Percentile fn vs the E. coli OSTIR reference (cached). x -> percentile of real genes <= x."""
@@ -341,12 +377,13 @@ class OLGCampaign:
         r = optimize_rbs(olg, **dict(scan["rbs_opt"]))
         if r.best is None:
             return {"rbs_base": round(base, 1), "rbs_rate": None, "rbs_pctile": None,
-                    "rbs_xbase": None, "rbs_n_mut": None, "rbs_method": r.method}
+                    "rbs_xbase": None, "rbs_n_mut": None, "rbs_method": r.method, "rbs_nt": None}
         rate = r.best.score.expression
         return {"rbs_base": round(base, 1), "rbs_rate": round(rate, 1),
                 "rbs_pctile": round(self.ecoli_percentile()(rate), 1),
                 "rbs_xbase": round(rate / base, 1) if base else None,
-                "rbs_n_mut": len(r.best.mutations), "rbs_method": r.method}
+                "rbs_n_mut": len(r.best.mutations), "rbs_method": r.method,
+                "rbs_nt": r.best.nt}                              # the final RBS-optimized DNA (for sequences())
 
     def design(self, screen_df, out_csv, *, device=None) -> pd.DataFrame:
         """Step 2: design the targeted top_k placements. Per placement runs a cell per `weights` w_gene
