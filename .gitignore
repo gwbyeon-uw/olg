@@ -33,3 +33,10 @@ scratch/
 
 # Archived (mexposit APEX, superseded by clean wrapper)
 archive/
+.claude/settings.local.json
+
+# E. coli reference genome (fetch from NCBI GCF_000005845.2; see demo/ecoli_reference/README)
+demo/ecoli_reference/data/*.gz
+
+# tooling caches
+.ruff_cache/

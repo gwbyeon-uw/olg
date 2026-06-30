@@ -2,7 +2,7 @@
 
 Design two proteins whose coding sequences overlap in different reading frames of the same DNA.
 
-![Summary](summary.png)
+![OLG iterative design](olg_iteration.gif)
 
 ## Background
 
