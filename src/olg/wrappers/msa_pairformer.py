@@ -9,7 +9,6 @@ import numpy.typing as npt
 from tqdm import tqdm
 
 from olg.constants import Constants
-from olg.config import ProteinConfig
 
 from MSA_Pairformer.model import MSAPairformer
 from MSA_Pairformer.dataset import aa2tok_d, tok2aa_d, prepare_msa_masks
@@ -79,6 +78,7 @@ class WrapperMSAPairformer(BaseWrapper):
         use_bfloat16: bool = True,
         seed_from_msa: bool = False,
         pad: tuple[int, int] = (0, 0),
+        skip_fixed_forward: bool = False,
         **kwargs,
     ):
         """Initialize MSA Pairformer wrapper.
@@ -99,6 +99,9 @@ class WrapperMSAPairformer(BaseWrapper):
                 Padded positions are NOT passed to the model — the forward pass
                 trims input to model_len and pads output back to seq_len. Use
                 logit_weight=0 and aa_bias at pad positions to control their AAs.
+            skip_fixed_forward: If True, skip the model forward at fixed positions (their value
+                is forced and never changes). Needs S seeded with the fixed (WT) residues so free
+                positions still get correct context. Makes forwards/sweep = #free positions.
             **kwargs: Passed to BaseWrapper (device, config, decoding_order, rand_base,
                 tqdm_disable, alphabet).
         """
@@ -108,6 +111,9 @@ class WrapperMSAPairformer(BaseWrapper):
         self.use_bfloat16 = use_bfloat16
         self.seed_from_msa = seed_from_msa
         self.pad_n, self.pad_c = pad
+        # skip the forward at fixed positions (their value is forced + never changes); requires
+        # S to hold the fixed residues throughout (seed WT). Default off = unchanged behavior.
+        self.skip_fixed_forward = skip_fixed_forward
         self.vocab_size = len(aa2tok_d)  # 28 — needed by BaseWrapper._apply_constraints
         self._build_alphabet_maps(self._NATIVE_VOCAB, extra_aa_map, self._DEFAULT_EXTRA_AA_MAP)
 
@@ -500,6 +506,16 @@ class WrapperMSAPairformer(BaseWrapper):
                 self.current_pred = torch.zeros(
                     (self.seq_len, self.LOGIT_DIM), device=self.device
                 )
+            elif (self.skip_fixed_forward and use_t_msa is None
+                  and t > -1 and self.fixed_positions[t] != -1):
+                # Fixed position: its value is forced downstream (_force_fixed_positions) and it
+                # is never re-decoded, so skip the costly forward. INVARIANT: this is correct only
+                # because S already holds the fixed (WT) residue here (seeded, never changed), so
+                # free positions still get correct context from it -- it does NOT depend on fixed
+                # positions being decoded first. current_pred is unused for fixed t.
+                self.current_pred = torch.zeros(
+                    (self.seq_len, self.LOGIT_DIM), device=self.device
+                )
             else:
                 if mask_current:
                     self.edit_S(t_msa, self.MASK_TOKEN, inplace=True)
@@ -520,6 +536,10 @@ class WrapperMSAPairformer(BaseWrapper):
             else:
                 logits_ = self.current_logits.clone()
                 logits_ -= logits_.mean()
+                # frame weight (inverse-temperature): scales this frame's distribution before the
+                # joint softmax-sum, so FrameBalancer / a Pareto sweep can trade it off vs the other
+                # frame. No-op at the default weight=1; bias/forcing below stay MIN_LOGIT-dominant.
+                logits_ = self.logit_weight[t] * logits_
                 logits_ = logits_[:, self.alphabet_map]
                 logits_[:, self.stop_index] = Constants.MIN_LOGIT
 
