@@ -21,6 +21,7 @@ dependencies = [
 boltz = ["boltz"]
 evodiff = ["evodiff"]
 esm = ["esm"]
+rbs = ["ostir", "ViennaRNA"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
