@@ -59,13 +59,6 @@ except ImportError:
     print("Skipping MSA Pairformer wrapper")
     msa_pairformer_avail = False
 
-try:
-    from olg.wrappers.apex import WrapperAPEX
-    apex_avail = True
-except ImportError:
-    print("Skipping APEX wrapper")
-    apex_avail = False
-
 class OLGDesign():
     def __init__(
         self,
@@ -162,7 +155,6 @@ class OLGDesign():
             "EvoDiff": WrapperEvoDiff if evodiff_avail else None,
             "EvoDiffSeq": WrapperEvoDiffSeq if evodiff_seq_avail else None,
             "MSAPairformer": WrapperMSAPairformer if msa_pairformer_avail else None,
-            "APEX": WrapperAPEX if apex_avail else None,
         }
 
         cls = decoder_classes.get(decoder_type)

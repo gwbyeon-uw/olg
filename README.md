@@ -19,7 +19,6 @@ This framework uses generative protein models to design synthetic OLGs. The core
 | **CoFlow** | Requires `coflow` package |
 | **EvoDiff-MSA** | Requires `evodiff` package; supports shared MSA mode |
 | **GREMLIN** | Built-in, no extra deps |
-| **APEX** | AMP MIC regressor; GREMLIN-style enumeration decoder (vendored model, no submodule) |
 | **ZeroOrder** | Built-in dummy model (uniform logits) |
 
 Any combination of models can be used (one per frame).
@@ -319,39 +318,6 @@ Keywords: `antimicrobial`, `antimicrobial peptide`, `defensin`, `bacteriocin`.
 
 Function conditioning can be combined with TAG guidance for dual control: ESM3 generates from the functional family distribution, while the classifier steers toward specific properties (e.g., potency, low hemolysis).
 
-### APEX (AMP potency decoder)
-
-[APEX](https://gitlab.com/machine-biology-group-public/apex) is a per-organism MIC regressor (34 strains). The wrapper uses it like GREMLIN — at each position it enumerates all 20 amino acids, scores the candidates with the ensemble, and builds a sampling distribution from predicted potency. It is a **frame decoder**, so the designed peptide is driven directly toward low MIC against a chosen organism.
-
-```python
-from olg.wrappers.apex import WrapperAPEX
-
-# Load the 40-model ensemble (checkpoints from the APEX GitLab repo)
-models = WrapperAPEX._load_ensemble("weights/apex", device)
-
-olg.initialize_decoder(
-    "APEX", frame=0, model=models,
-    organism="E. coli ATCC11775",  # single target organism (no aggregation)
-    temperature=0.5,               # softmax temperature on -log10(MIC)
-)
-```
-
-**Energy function** — for each candidate AA at position `t`, the ensemble predicts MIC (µM) for the target organism (averaged in linear µM space). The Boltzmann mapping is:
-
-```
-score(aa) = -log10(MIC_target(aa)) / temperature      # higher = more potent
-P(aa | context) = softmax(score)
-```
-
-so energy `E(aa) = log10(MIC_target(aa))` — lower MIC → lower energy → higher sampling probability.
-
-**Notes:**
-- APEX alphabet is the 20 standard amino acids only (no gap/stop/extended); other OLG alphabet entries (`X`, `J`, …) are held at `MIN_LOGIT` and never sampled.
-- Max peptide length 50; no MSA, no gaps.
-- The model class is vendored (`wrappers/_vendored/apex/model.py`) — no git submodule required. Download the 40 checkpoints into `weights/apex/`.
-- `decoders[frame].get_mic(organism=...)` returns the predicted MIC of the current sequence for any organism (see `WrapperAPEX.organism` list).
-- Two frames can target different pathogens simultaneously (e.g. E. coli // S. aureus) in overlapping reading frames.
-
 ### Classifier-guided decoding (TAG)
 
 The `GuidedWrapper` adds [Taylor-Approximated Guidance](https://arxiv.org/abs/2406.01572) to any decoder, biasing sampling toward sequences with desired properties (e.g., antimicrobial activity, low hemolysis) without modifying the base model.
@@ -450,8 +416,6 @@ src/olg/
     msa_pairformer.py    # MSA Pairformer wrapper (MSA-based + contact prediction)
     guided.py            # GuidedWrapper — TAG classifier guidance for any decoder
     gremlin.py           # GREMLIN wrapper
-    apex.py              # APEX AMP MIC regressor (GREMLIN-style enumeration decoder)
-    _vendored/apex/      # vendored APEX model class (for unpickling checkpoints)
   structure/
     boltz.py             # Boltz2 wrapper (monomer + binder hallucination)
 ```

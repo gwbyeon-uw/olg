@@ -9,7 +9,7 @@ One YAML + two injected per-frame objectives (model-agnostic plug-ins) drive the
 
 The campaign owns *structure + search* (genetic code, lock, quartet lookups, feasibility, the design
 cell, OLGDesign wiring, the E. coli percentile). It imports `olg` / `olgrbs` only — never a concrete
-protein model; APEX / MSA-Pairformer live behind the injected objectives so this stays reusable for a
+protein model; the scoring models live behind the injected objectives so this stays reusable for a
 different gene / peptide / model.
 """
 from __future__ import annotations
@@ -36,7 +36,7 @@ from .feasibility import build_free_gene_sets, build_quartet_lookup
 # ── injected per-frame objective plug-ins (orchestrator-defined, caller-implemented) ──────────────
 class FrameObjective(Protocol):
     """A pluggable per-frame design objective. Keeps orchestrator model-agnostic: the caller wires the
-    concrete model (APEX, MSA-Pairformer, ...) behind this protocol."""
+    concrete model behind this protocol."""
 
     metric_name: str  # result-row column for this frame's score (e.g. "mic_uM", "gene_plausibility")
 

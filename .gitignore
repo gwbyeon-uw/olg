@@ -31,7 +31,7 @@ src/olg/wrappers/guidance.py
 # Scratch / analysis
 scratch/
 
-# Archived (mexposit APEX, superseded by clean wrapper)
+# Archived (superseded)
 archive/
 .claude/settings.local.json
 
