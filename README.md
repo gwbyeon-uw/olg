@@ -429,6 +429,63 @@ for i in range(n_cycles):
         break
 ```
 
+## RBS design (olgrbs)
+
+`olgrbs` optimizes the **inner** gene's ribosome binding site directly on an `olg` `OLGDesign`. It walks the outer protein's synonymous space (plus the overlap's dual-coding freedom), scores each candidate with [OSTIR](https://github.com/barricklab/ostir) (the Salis 2009 ΔG model), and returns candidates that are **protein-preserving by construction** — the outer CDS translation never changes, and only synonymous inner-CDS changes are made in the overlap. It picks exact enumeration vs. simulated annealing automatically, by the (cheap) count of reachable fold windows.
+
+```python
+from olgrbs import optimize_rbs, score_rbs, rbs_window
+
+# `design` is an OLGDesign whose frame-2 (inner) gene carries the ATG to tune.
+res  = optimize_rbs(design, objective="max")    # or objective=<target expression>
+best = res.best                                 # ranked best-first; None if nothing scored
+print(best.score.expression, best.mutations)    # OSTIR rate proxy + [(outer_idx, old_codon, new_codon), ...]
+print(res.rate_range(), res.design_room_bits()) # (min, median, max) expression; log2 of distinct windows
+
+# Score one start codon directly (thin OSTIR wrapper, cached over the ±35 nt fold window):
+sc = score_rbs(best.nt, rbs_window(design).inner_start_nt)
+print(sc.expression)                            # None if there is no valid start codon there
+```
+
+| `optimize_rbs` parameter | Default | Description |
+|-----------|---------|-------------|
+| `objective` | `"max"` | `"max"`, or a target expression value to hit |
+| `open_overlap` | `True` | also sample the inner CDS's dual-synonymous freedom (only synonymous AMP changes) |
+| `w_up` / `w_down` | `13` / `13` | up/downstream codons bounding the window (≥12 covers OSTIR's ±35 nt) |
+| `enumerate_cap` | `100_000` | enumerate exactly below this reachable-path count, else anneal |
+| `sa_steps` / `sa_restarts` | `2000` / `5` | annealing budget when the space is too large to enumerate |
+| `seed` | `0` | RNG seed (deterministic) |
+
+Antisense arrangements (reverse-strand inner gene) are not supported in v1.
+
+## Campaign orchestration (OLGCampaign)
+
+`OLGCampaign` (in `orchestrator`) is the config-driven, **model-agnostic** top layer over `olg` (the design engine) and `olgrbs` (RBS design). It reads a campaign YAML, takes per-frame objectives as injected plug-ins, and runs the pipeline `screen()` → `design()` → `sequences()`. It imports no concrete model — you wire APEX / MSA-Pairformer / your own behind two small protocols:
+
+- **`FrameObjective`** — `attach(olg, frame)` (initialize the frame's decoder) + `score(olg, frame, free)` (scalar objective for the decoded frame); carries a `metric_name` used as its result column.
+- **`SequenceScorer`** — `score_sequences(seqs)`, the cheap batch potency proxy the screen uses.
+- **`AmpObjective`** = both, because the AMP frame needs the screen proxy *and* a design decoder.
+
+```python
+from orchestrator import OLGCampaign
+
+camp = OLGCampaign.from_yaml("campaign.yaml", session="codesign")
+
+# Inject your objectives (concrete models live behind the protocols above).
+# screen() needs only `amp` (its score_sequences); design() needs both frames.
+camp.set_objectives(gene=MyGeneObjective(...), amp=MyAmpObjective(...))
+
+screen_df = camp.screen()                        # Step 1: feasibility + cheap metrics over the placement grid
+scan_df   = camp.design(screen_df, "scan.csv")   # Step 2: co-design the targeted placements, then optimize each RBS
+
+# Step 3: realize a design's orderable sequences from its RBS-optimized DNA
+# (arr / off / amp_seq / mut_aa / rbs_nt come from a scan_df row)
+seqs = camp.sequences(arr, off, amp_seq, mut_aa, final_nt=rbs_nt)
+print(seqs["full_dna"], seqs["amp_protein"], seqs["rbs_upstream"])
+```
+
+`sequences()` returns the complete inner-gene CDS (`full_dna`, RBS-optimized — the orderable construct), both frame translations (`fabd_protein`, `amp_protein`), the nested AMP ORF (`amp_cds`), and the RBS pieces (`rbs_upstream`, `rbs_fold_window`) with a recomputed OSTIR rate/percentile. The YAML holds the shared blocks (`inputs`; `genetic_code` for the S/J serine split; `lock` = catalytic + conserved positions; `design` = arrangements + stop codons) plus one block per session (`screen` / `scan` parameters), so `screen()` can run without ever loading the design models.
+
 ## Project structure
 
 ```
