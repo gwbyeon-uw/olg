@@ -10,16 +10,16 @@ This framework uses generative protein models to design synthetic OLGs. The core
 
 ## Supported models
 
-| Model | Notes |
-|-------|-------|
-| **ProteinMPNN** | Supports complexes via tied decoding |
-| **MSA Pairformer** | Requires `msa-pairformer` package; MSA-based with contact prediction |
-| **ESM3** | Requires `esm` package; supports function-conditioned generation |
-| **EvoDiff-seq** | Requires `evodiff` package; single-sequence OADM (no MSA needed) |
-| **CoFlow** | Requires `coflow` package |
-| **EvoDiff-MSA** | Requires `evodiff` package; supports shared MSA mode |
-| **GREMLIN** | Built-in, no extra deps |
-| **ZeroOrder** | Built-in dummy model (uniform logits) |
+| Model | Source | Notes |
+|-------|--------|-------|
+| **ProteinMPNN** | [dauparas/ProteinMPNN](https://github.com/dauparas/ProteinMPNN) | Built-in |
+| **MSA Pairformer** | [yoakiyama/MSA_Pairformer](https://github.com/yoakiyama/MSA_Pairformer) | Requires `msa-pairformer` package |
+| **ESM3** | [evolutionaryscale/esm](https://github.com/evolutionaryscale/esm) | Requires `esm` package |
+| **EvoDiff-seq** | [microsoft/evodiff](https://github.com/microsoft/evodiff) | Requires `evodiff` package |
+| **CoFlow** | [LtECoD/CoFlow](https://github.com/LtECoD/CoFlow) | Requires `coflow` package |
+| **EvoDiff-MSA** | [microsoft/evodiff](https://github.com/microsoft/evodiff) | Requires `evodiff` package |
+| **GREMLIN** | [sokrypton/GREMLIN_CPP](https://github.com/sokrypton/GREMLIN_CPP) | Built-in |
+| **ZeroOrder** | — | Built-in (dummy uniform decoder) |
 
 Any combination of models can be used (one per frame).
 
@@ -233,7 +233,7 @@ Fixed chains are encoded first in the autoregressive pass, so every logit predic
 
 ### MSA Pairformer
 
-[MSA Pairformer](https://github.com/yoakiyama/MSA_Pairformer) is a lightweight MSA transformer that produces per-position amino acid logits from multiple sequence alignments. It also provides optional contact predictions (Cb-Cb and ConFind).
+[MSA Pairformer](https://github.com/yoakiyama/MSA_Pairformer) is an MSA transformer that produces per-position amino acid logits from multiple sequence alignments. It also provides optional contact predictions (Cb-Cb and ConFind).
 
 **Installation:**
 
@@ -269,10 +269,10 @@ olg.initialize_decoder(
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `msa_n_seq` | `128` | MSA depth. 64-256 recommended for good contact prediction |
+| `msa_n_seq` | `128` | MSA depth (64-256 recommended) |
 | `msa_max_length` | — | Sequence length matching the MSA columns |
 | `msa_selection_type` | `'random'` | `'MaxHamming'` for diverse subsampling |
-| `seed_from_msa` | `False` | Seed query from MSA query sequence. Recommended — keeps masking close to training distribution |
+| `seed_from_msa` | `False` | Seed query from MSA query sequence (recommended) |
 | `use_bfloat16` | `True` | bfloat16 autocast for GPU inference |
 | `pad` | `(0, 0)` | N/C-terminal padding (positions excluded from model, steered via `logit_weight`/`aa_bias`) |
 
@@ -285,13 +285,11 @@ confind_contacts = contacts['confind_contacts']  # [1, L, L] interface contacts
 ```
 
 **Notes:**
-- MSA Pairformer is trained with 15% BERT-style masking. Starting from a fully masked query (default) is out-of-distribution. Use `seed_from_msa=True` for better initial sequences.
 - Padding positions are trimmed before the model forward pass and zero-padded on output. Use `logit_weight=0` and `aa_bias` to steer padded positions.
-- The model runs a full forward pass per decoding position (~80-180ms depending on MSA depth). Gibbs refinement iterations each take ~20s for 100-residue proteins on an L4 GPU.
 
 ### ESM3 with function conditioning
 
-ESM3 supports function-conditioned generation via InterPro annotations and keywords. This enables generating sequences with specific functional properties (e.g., antimicrobial activity) built into the generative model itself.
+ESM3 supports function-conditioned generation via [InterPro](https://www.ebi.ac.uk/interpro/) annotations and keywords. This enables generating sequences with specific functional properties (e.g., antimicrobial activity) built into the generative model itself.
 
 ```python
 olg.initialize_decoder(
@@ -354,7 +352,7 @@ class MyClassifier:
         ...
 ```
 
-The classifier must accept one-hot input (`requires_grad=True`) and return a differentiable scalar log-probability. Use `StraightThroughEmbedding` to make embedding-based classifiers (ESM-2, ProtBERT) differentiable through discrete tokens.
+The classifier must accept one-hot input (`requires_grad=True`) and return a differentiable scalar log-probability. Use `StraightThroughEmbedding` to make embedding-based classifiers ([ESM-2](https://github.com/facebookresearch/esm), [ProtBERT](https://github.com/agemagician/ProtTrans)) differentiable through discrete tokens.
 
 ### Structure hallucination with Boltz2
 
