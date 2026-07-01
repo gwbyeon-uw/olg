@@ -390,6 +390,45 @@ Binder hallucination tricks (from Protein-Hunter):
 - **Helix killing**: disrupts i→i+4 pairwise features on the binder chain, encouraging diverse folds
 - **ipTM tracking**: inter-chain predicted TM-score as the binding quality metric
 
+**Iterating structure prediction ↔ ProteinMPNN (binder co-design).** `olg` ships both halves of Protein-Hunter's `num_cycles` loop — the Boltz2 wrapper and the ProteinMPNN frame decoder — so you can assemble it directly: hallucinate a starting complex, then iterate — redesign the binder with ProteinMPNN, predict the new sequence's structure, feed it back — keeping the best ipTM. Because the redesign step is the OLG frame decoder, the binder stays overlap-constrained the whole way.
+
+```python
+# Assumes `olg` (an OLGDesign for the overlap), `mpnn_model`, `boltz_model`,
+# and `target_seq` are set up as in the sections above.
+boltz_ph = BoltzPHWrapper(boltz_model, BoltzPHConfig(
+    mode="binder", protein_seqs=target_seq, ccd_path="weights/mols"))
+boltz_ph.reset()
+target_chains = ["B"]          # target chain(s) in the complex; "A" is the binder
+
+# Seed: hallucinate a complex for a random binder, then condition ProteinMPNN on it
+boltz_out, _ = boltz_ph.run_prediction(
+    BoltzPHWrapper.sample_seq(core_length), "A", "iter0.pdb")   # core_length = binder length
+olg.initialize_decoder("ProteinMPNN", frame=1, model=mpnn_model,
+                       pdb_path="iter0.pdb", fixed_chains=target_chains, design_chains=["A"])
+best = {"iptm": BoltzPHWrapper.compute_iptm(boltz_out, "A"), "seq": None}
+
+for i in range(n_cycles):
+    # (a) redesign the binder against the current structure (OLG-constrained Gibbs)
+    for _ in range(n_gibbs):
+        olg.decode_all_gibbs(dummy_run=(True, False),
+                             next_order=olg.get_next_order("entropy"))
+    _, binder_seq = olg.translate_sequences()        # frame 1 = the overlap binder
+
+    # (b) predict the complex from the redesigned sequence
+    boltz_out, _ = boltz_ph.run_prediction(binder_seq, "A", f"iter{i+1}.pdb")
+    boltz_ph.clean_memory()
+    iptm = BoltzPHWrapper.compute_iptm(boltz_out, "A")
+
+    # (c) feed the new structure back into ProteinMPNN for the next round
+    olg.decoders[1]._set_target_from_pdb(
+        f"iter{i+1}.pdb", fixed_chains=target_chains, design_chains=["A"])
+
+    if iptm > best["iptm"]:
+        best = {"iptm": iptm, "seq": binder_seq}
+    if iptm >= 0.7:              # early-stop once binding confidence is high
+        break
+```
+
 ## Project structure
 
 ```
