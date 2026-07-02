@@ -458,9 +458,42 @@ print(sc.expression)                            # None if there is no valid star
 
 Antisense arrangements (reverse-strand inner gene) are not supported in v1.
 
+## 5′UTR design (olg5utr)
+
+`olg5utr` designs a **5′UTR shared by two overlapping ORFs** to maximize their translation. The window is a **free 5′ region** (fully unconstrained) followed by the **outer gene's CDS** (single-synonymous); the inner gene's ATG sits just downstream, so the outer 5′UTR is the free region and the inner 5′UTR is the whole window. It scores mean ribosome load with [Optimus 5-Prime](https://github.com/pjsample/human_5utr_modeling) (Sample et al., trained on a human 5′UTR MPRA) on **both** ORFs and searches by **discrete** greedy/annealing. Every move is a free-region base change or a synonymous codon swap, so the outer protein is **preserved by construction** (no differentiable translator needed).
+
+```python
+from olg5utr import UTRDesign, load_optimus, optimize_utr
+
+model  = load_optimus("weights/optimus_mrl_multi.pth", device)   # weights user-provided (not bundled)
+# free 5'UTR (20 nt) + outer-gene CDS (single-synonymous); inner ATG just downstream.
+design = UTRDesign(outer_protein="MVSKGEELFTGVVPILVELD", free_len=20, w_mrl=0.5)
+res  = optimize_utr(design, model)              # discrete search over both ORFs' MRL
+best = res.best                                 # ranked best-first
+print(best.free_utr, best.outer_cds)            # designed 5'UTR + synonymous outer CDS (the orderable insert)
+print(best.score.combined, best.score.mrl_outer, best.score.mrl_inner)
+```
+
+| `UTRDesign` field | Default | Description |
+|-----------|---------|-------------|
+| `outer_protein` | — | outer gene AA sequence (incl. start `M`); its CDS is held fixed up to synonymous choice |
+| `free_len` | — | length of the free 5′ region (the outer gene's 5′UTR) |
+| `w_mrl` | `0.5` | dual-MRL weight: `w·MRL_outer + (1-w)·MRL_inner` |
+| `codon_table` | standard | genetic code; use `build_restricted_codon_table` for a custom code |
+
+| `optimize_utr` parameter | Default | Description |
+|-----------|---------|-------------|
+| `n_parallel` | `50` | independent search trajectories (batched — one Optimus forward per step) |
+| `steps` | `4000` | single-move steps per trajectory |
+| `tau` | `0.0` | acceptance temperature: `0` = greedy hill-climb, `>0` = Metropolis (escapes local optima) |
+| `top` | `20` | ranked candidates returned |
+| `seed` | `0` | RNG seed (deterministic) |
+
+The inner 5′UTR must be ≤ 100 nt (Optimus's input); same-strand only.
+
 ## Campaign orchestration (OLGCampaign)
 
-`OLGCampaign` (in `orchestrator`) is the config-driven, **model-agnostic** top layer over `olg` (the design engine) and `olgrbs` (RBS design). It reads a campaign YAML, takes per-frame objectives as injected plug-ins, and runs the pipeline `screen()` → `design()` → `sequences()`. It imports no concrete model — you wire APEX / MSA-Pairformer / your own behind two small protocols:
+`OLGCampaign` (in `orchestrator`) is the config-driven, **model-agnostic** top layer over `olg` (the design engine) and `olgrbs` (RBS design). It reads a campaign YAML, takes per-frame objectives as injected plug-ins, and runs the pipeline `screen()` → `design()` → `sequences()`. It imports no concrete model — you wire MSA-Pairformer / your own behind two small protocols:
 
 - **`FrameObjective`** — `attach(olg, frame)` (initialize the frame's decoder) + `score(olg, frame, free)` (scalar objective for the decoded frame); carries a `metric_name` used as its result column.
 - **`SequenceScorer`** — `score_sequences(seqs)`, the cheap batch potency proxy the screen uses.
@@ -512,6 +545,9 @@ src/olg/
     gremlin.py           # GREMLIN wrapper
   structure/
     boltz.py             # Boltz2 wrapper (monomer + binder hallucination)
+src/olgrbs/              # bacterial RBS design (OSTIR) over an OLGDesign
+src/olg5utr/             # 5'UTR design (Optimus MRL), discrete search
+src/orchestrator/        # OLGCampaign — config-driven screen -> design -> sequences
 ```
 
 ## Citation
