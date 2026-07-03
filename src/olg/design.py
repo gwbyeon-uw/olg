@@ -302,11 +302,14 @@ class OLGDesign():
                 (fixed_f2_prev, fixed_f2, fixed_f2_next), 
                 self.compatibility.codon_table_rev
             )
-            codon_compatibility_fixed_mask = torch.zeros(self.compatibility.codon_compatibility.shape, device=self.config.device).int()
-            codon_compatibility_fixed_mask[:, :, :, :, :, compatible_q_i] = 1
+            # mask is 1 only at [...,compatible_q_i], constant across the first 5 dims -> a (256,)
+            # broadcast over the quartet dim, avoiding a 43 MB per-step allocation
+            fixed_mask = torch.zeros(self.compatibility.codon_compatibility.shape[-1],
+                                     dtype=compatibility.dtype, device=self.config.device)
+            fixed_mask[compatible_q_i] = 1
             if compatibility is self.compatibility.codon_compatibility:  # don't mutate the shared master
                 compatibility = compatibility.clone()
-            compatibility *= codon_compatibility_fixed_mask
+            compatibility *= fixed_mask
             
         compatibility = (~(compatibility[p_n[:, 0], p_n[:, 1], self.config.arrangement, :, :, :].bool())) #Get compatibility matrix, for given first and last nucleotide of quartets
         
