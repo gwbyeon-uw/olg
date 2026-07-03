@@ -8,6 +8,10 @@ from Bio.Data.CodonTable import unambiguous_dna_by_name
 from olg.constants import *
 from olg.config import DesignConfig
 
+# (codon_table, alphabet, device) -> (codon_compatibility, quartets_aa). The matrix is design-independent
+# and never mutated in place (decode clones before writing), so one copy is shared across all designs.
+_COMPAT_CACHE: dict = {}
+
 
 class CodonCompatibility:
     """Manages codon compatibility matrices and quartet operations"""
@@ -31,9 +35,12 @@ class CodonCompatibility:
             for stop_codon in ncbi_table.stop_codons:
                 self.codon_table[stop_codon] = "X"
         self.codon_table_rev = Constants._reverse_codon_table(self.codon_table)
-        self.codon_compatibility, self.quartets_aa = self.generate_compatibility_matrix(
-            self.config.device, self.codon_table, self.alphabet, self.alphabet_index
-        )
+        key = (frozenset(self.codon_table.items()), tuple(self.alphabet), str(self.config.device))
+        if key not in _COMPAT_CACHE:
+            _COMPAT_CACHE[key] = self.generate_compatibility_matrix(
+                self.config.device, self.codon_table, self.alphabet, self.alphabet_index
+            )
+        self.codon_compatibility, self.quartets_aa = _COMPAT_CACHE[key]
         
         #First/last nucleotide for each of the 256 quartets
         self.prev_quartet_index = torch.tensor(Constants.PREV_QUARTET_INDEX).long()
