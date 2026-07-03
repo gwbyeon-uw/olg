@@ -275,13 +275,14 @@ class OLGDesign():
 
         apply_start1 = self.config.protein1.force_start and (t_f1 == self.config.protein1.start_offset)
         apply_start2 = self.config.protein2.force_start and (t_f2 == self.config.protein2.start_offset)
-        compatibility = self.compatibility.codon_compatibility
-        if apply_start1 or apply_start2:
-            compatibility = compatibility.clone()
-            if apply_start1:
-                compatibility *= self.compatibility.codon_compatibility_start_mask[0]
-            if apply_start2:
-                compatibility *= self.compatibility.codon_compatibility_start_mask[1]
+        # Reduce to the (p_n, aa, aa, quartet) working tensor up front. Advanced indexing copies, so we
+        # own `compat` and never clone the 43 MB master. Every constraint mask below is constant across
+        # the indexed dims, so it applies as a (256,) broadcast over the quartet dim.
+        compat = self.compatibility.codon_compatibility[p_n[:, 0], p_n[:, 1], self.config.arrangement, :, :, :]
+        if apply_start1:
+            compat *= self.compatibility.codon_compatibility_start_mask[0][0, 0, 0, 0, 0, :]
+        if apply_start2:
+            compat *= self.compatibility.codon_compatibility_start_mask[1][0, 0, 0, 0, 0, :]
         
         #Fixed position mask. fixed_positions_set is stored in offset-free (0-based residue)
         #coordinates, but t_f1/t_f2 are offset-included (= start_offset + residue); convert back.
@@ -294,24 +295,19 @@ class OLGDesign():
         fixed_f2_prev = self.coords.fixed_positions_set[1][r_f2-1] if (r_f2 > 0) else None
         fixed_f2_next = self.coords.fixed_positions_set[1][r_f2+1] if (r_f2 != -1 and (r_f2 + 1) < self.coords.f2_gap_len) else None
 
-        compatibility_safe = compatibility.clone() if force_safe else None  # only read in force_safe branch
+        compat_safe = compat.clone() if force_safe else None  # snapshot after start, before fixed
         if any(x is not None for x in [fixed_f1, fixed_f1_prev, fixed_f1_next, fixed_f2, fixed_f2_prev, fixed_f2_next]):
             compatible_q_i = self.compatibility.compatible_quartets_by_aa(
-                self.config.arrangement, 
-                (fixed_f1_prev, fixed_f1, fixed_f1_next), 
-                (fixed_f2_prev, fixed_f2, fixed_f2_next), 
+                self.config.arrangement,
+                (fixed_f1_prev, fixed_f1, fixed_f1_next),
+                (fixed_f2_prev, fixed_f2, fixed_f2_next),
                 self.compatibility.codon_table_rev
             )
-            # mask is 1 only at [...,compatible_q_i], constant across the first 5 dims -> a (256,)
-            # broadcast over the quartet dim, avoiding a 43 MB per-step allocation
-            fixed_mask = torch.zeros(self.compatibility.codon_compatibility.shape[-1],
-                                     dtype=compatibility.dtype, device=self.config.device)
+            fixed_mask = torch.zeros(compat.shape[-1], dtype=compat.dtype, device=self.config.device)
             fixed_mask[compatible_q_i] = 1
-            if compatibility is self.compatibility.codon_compatibility:  # don't mutate the shared master
-                compatibility = compatibility.clone()
-            compatibility *= fixed_mask
-            
-        compatibility = (~(compatibility[p_n[:, 0], p_n[:, 1], self.config.arrangement, :, :, :].bool())) #Get compatibility matrix, for given first and last nucleotide of quartets
+            compat *= fixed_mask
+
+        compatibility = (~(compat.bool())) #Get compatibility matrix, for given first and last nucleotide of quartets
         
         quartets_logits_joint = logits_joint.repeat(compatibility.shape[0], 1, 1).unsqueeze(3).repeat(1, 1, 1, Constants.QUARTET_SIZE) #Joint logits, repeated so that we can mask with compatibility matrix
         quartets_logits_joint[compatibility] = Constants.MIN_LOGIT #Mask joint logits matrix with compatibility matrix
@@ -319,7 +315,7 @@ class OLGDesign():
         
         if masked_logits_joint.max() == Constants.MIN_LOGIT: #Invalid case
             if force_safe:
-                compatibility_safe = (~(compatibility_safe[p_n[:, 0], p_n[:, 1], self.config.arrangement, :, :, :].bool()))
+                compatibility_safe = (~(compat_safe.bool()))
                 quartets_logits_joint = logits_joint_safe.repeat(compatibility_safe.shape[0], 1, 1).unsqueeze(3).repeat(1, 1, 1, Constants.QUARTET_SIZE)
                 quartets_logits_joint[compatibility_safe] = Constants.MIN_LOGIT #Mask joint logits matrix with compatibility matrix
                 masked_logits_joint = torch.clamp(quartets_logits_joint, min=Constants.MIN_LOGIT)
