@@ -8,8 +8,8 @@ from Bio.Data.CodonTable import unambiguous_dna_by_name
 from olg.constants import *
 from olg.config import DesignConfig
 
-# (codon_table, alphabet, device) -> (codon_compatibility, quartets_aa). The matrix is design-independent
-# and never mutated in place (decode clones before writing), so one copy is shared across all designs.
+# (codon_table, alphabet, device) -> (codon_compatibility, quartets_aa). Design-independent and only
+# ever read (decode indexes into a copy), so a single instance is shared across all designs.
 _COMPAT_CACHE: dict = {}
 
 

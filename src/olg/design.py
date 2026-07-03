@@ -120,12 +120,12 @@ class OLGDesign():
             self.quartet_list = copy.deepcopy(seed_quartet_list)
             
         self.nuc = None
-        self.debug_logits = False  # when True, record per-step logits below for inspection
-        self.unmasked_logits_joint = [] #This tracks joint probability matrix at each step
-        self.masked_logits_joint = [] #This tracks joint probability matrix at each step masked by compatibility
-        self.logits_f1 = [] #This tracks logits at each decoding step
-        self.logits_f2 = [] 
-        self.logits_f1_ = [] #This will track logits at each decoding step before applying various weights and filters
+        self.debug_logits = False  # set True to record the per-step logit trace below
+        self.unmasked_logits_joint = []
+        self.masked_logits_joint = []
+        self.logits_f1 = []
+        self.logits_f2 = []
+        self.logits_f1_ = []
         self.logits_f2_ = []
 
         self.balancer.reset()
@@ -250,13 +250,12 @@ class OLGDesign():
         logits_joint = torch.log(logits_f1.softmax(-1)).unsqueeze(-1) + torch.log(logits_f2.softmax(-1)).unsqueeze(-2)
         logits_joint_safe = logits_f1_.unsqueeze(-1) + logits_f2_.unsqueeze(-2)
         
-        #Keep track the logits for sanity checks
-        if self.debug_logits:
-            self.logits_f1 += [ logits_f1.clone().detach() ] #Logits from the decoder after applying weights/filtering
+        if self.debug_logits:  # optional per-step logit trace, off by default
+            self.logits_f1 += [ logits_f1.clone().detach() ]
             self.logits_f2 += [ logits_f2.clone().detach() ]
-            self.logits_f1_ += [ logits_f1_.clone().detach() ] #Logits from the decoder prior to applying weights/filtering
+            self.logits_f1_ += [ logits_f1_.clone().detach() ]
             self.logits_f2_ += [ logits_f2_.clone().detach() ]
-            self.unmasked_logits_joint += [ logits_joint.clone().detach() ] #Joint logits prior to applying compatibility mask
+            self.unmasked_logits_joint += [ logits_joint.clone().detach() ]
         
         #If previous quartet was already decoded, then we need to consider this constraint
         q_p = torch.tensor([0, 1, 2, 3], device=self.config.device).long() #To allow all first nucleotide if previous position was not decoded yet
@@ -275,9 +274,8 @@ class OLGDesign():
 
         apply_start1 = self.config.protein1.force_start and (t_f1 == self.config.protein1.start_offset)
         apply_start2 = self.config.protein2.force_start and (t_f2 == self.config.protein2.start_offset)
-        # Reduce to the (p_n, aa, aa, quartet) working tensor up front. Advanced indexing copies, so we
-        # own `compat` and never clone the 43 MB master. Every constraint mask below is constant across
-        # the indexed dims, so it applies as a (256,) broadcast over the quartet dim.
+        # Compatibility for the current (first, last) nucleotide pairs, shape (p_n, aa, aa, quartet).
+        # Constraint masks are constant across all but the quartet dim, so they apply as (256,) broadcasts.
         compat = self.compatibility.codon_compatibility[p_n[:, 0], p_n[:, 1], self.config.arrangement, :, :, :]
         if apply_start1:
             compat *= self.compatibility.codon_compatibility_start_mask[0][0, 0, 0, 0, 0, :]
@@ -295,7 +293,8 @@ class OLGDesign():
         fixed_f2_prev = self.coords.fixed_positions_set[1][r_f2-1] if (r_f2 > 0) else None
         fixed_f2_next = self.coords.fixed_positions_set[1][r_f2+1] if (r_f2 != -1 and (r_f2 + 1) < self.coords.f2_gap_len) else None
 
-        compat_safe = compat.clone() if force_safe else None  # snapshot after start, before fixed
+        # The force_safe fallback relaxes the fixed-position constraint, so snapshot before it is applied.
+        compat_safe = compat.clone() if force_safe else None
         if any(x is not None for x in [fixed_f1, fixed_f1_prev, fixed_f1_next, fixed_f2, fixed_f2_prev, fixed_f2_next]):
             compatible_q_i = self.compatibility.compatible_quartets_by_aa(
                 self.config.arrangement,
@@ -307,7 +306,7 @@ class OLGDesign():
             fixed_mask[compatible_q_i] = 1
             compat *= fixed_mask
 
-        compatibility = (~(compat.bool())) #Get compatibility matrix, for given first and last nucleotide of quartets
+        compatibility = (~(compat.bool())) #True where a quartet is incompatible, i.e. to be masked out
         
         quartets_logits_joint = logits_joint.repeat(compatibility.shape[0], 1, 1).unsqueeze(3).repeat(1, 1, 1, Constants.QUARTET_SIZE) #Joint logits, repeated so that we can mask with compatibility matrix
         quartets_logits_joint[compatibility] = Constants.MIN_LOGIT #Mask joint logits matrix with compatibility matrix
