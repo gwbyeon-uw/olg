@@ -10,6 +10,7 @@ against tests/ostir_parity.py. Validated field-for-field against the OSTIR golde
 from __future__ import annotations
 
 import warnings
+from functools import cache
 
 from .scorer import ECOLI_ANTI_SD, RBSScore
 
@@ -28,8 +29,30 @@ def _leaves():
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*missing dependency ViennaRNA.*")
         from ostir.ostir_calculations import (
-            calc_dG_mRNA, calc_dG_mRNA_rRNA, calc_dG_standby_site, calc_expression_level)
-    return calc_dG_mRNA, calc_dG_mRNA_rRNA, calc_dG_standby_site, calc_expression_level
+            calc_dG_mRNA_rRNA, calc_dG_standby_site, calc_expression_level)
+    return calc_dG_mRNA_rRNA, calc_dG_standby_site, calc_expression_level
+
+
+@cache
+def _params(dangles: str):
+    """OSTIR's exact rna2004 parameter object, reused so folding is bit-identical."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*missing dependency ViennaRNA.*")
+        from ostir.ViennaRNA import get_paramater_object, vienna_constants
+    return get_paramater_object(vienna_constants.material, 37.0, dangles)
+
+
+def _mfe_energy(seq: str, dangles: str) -> float:
+    """MFE of a single strand, matching ostir.ViennaRNA.mfe (energy rounded to 2 dp)."""
+    import RNA
+    _, energy = RNA.fold_compound(seq.upper().replace("T", "U"), _params(dangles)).mfe()
+    return round(energy, 2)
+
+
+def _dG_mRNA(mRNA: str, start_pos: int, dangles: str) -> float:
+    """dG of mRNA folding = MFE of the [-cutoff, +cutoff] window (calc_dG_mRNA, structure unused here)."""
+    window = mRNA[max(0, start_pos - _CUTOFF):min(len(mRNA), start_pos + _CUTOFF)]
+    return _mfe_energy(window, dangles)
 
 
 def score_rbs_fast(nt: str, inner_start: int, asd: str = ECOLI_ANTI_SD) -> RBSScore | None:
@@ -53,12 +76,12 @@ def score_rbs_fast(nt: str, inner_start: int, asd: str = ECOLI_ANTI_SD) -> RBSSc
     if codon.upper() not in _START_CODONS:
         return None
 
-    calc_dG_mRNA, calc_dG_mRNA_rRNA, calc_dG_standby_site, calc_expression_level = _leaves()
+    calc_dG_mRNA_rRNA, calc_dG_standby_site, calc_expression_level = _leaves()
     constraints = None
     dangles = "none" if start_pos > _CUTOFF else "all"   # _parallel_dG auto_dangles
     dG_start = _START_ENERGY[codon.upper()]
 
-    dG_mRNA, _mrna_struct, _kin, _minbp = calc_dG_mRNA(mRNA, start_pos, dangles, constraints)
+    dG_mRNA = _dG_mRNA(mRNA, start_pos, dangles)
 
     try:
         withspacing, rr_struct, spacing_value = calc_dG_mRNA_rRNA(mRNA, rRNA, start_pos, dangles, constraints)
