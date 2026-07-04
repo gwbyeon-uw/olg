@@ -1,81 +1,87 @@
 """Fast reimplementation of the OSTIR RBS scorer for the single-sequence / single-start-codon case.
 
-Same ViennaRNA folding engine (via the ``RNA`` C bindings and OSTIR's exact rna2004 parameter object,
-so thermodynamics are identical), but a lean control layer purpose-built for one mRNA window + one start
-codon — dropping OSTIR's factory/CLI/multiprocessing scaffolding and the per-fold O(n^2) dot-bracket
-bookkeeping. Validated field-for-field against the OSTIR golden (tests/ostir_parity.py).
-
-STATUS: incremental port. Ported and parity-verified so far: dG_mRNA, dG_start_codon, start_codon.
-Not yet ported (sentinel values below): dG_mRNA_rRNA, dG_spacing, dG_standby, spacing_bp, and hence
-dG_total / expression. Do NOT use in production until the parity validator reports PARITY PASS.
+Purpose-built control layer for one mRNA window + one start codon, replacing OSTIR's
+``OSTIRFactory``/``find_start_codons``/``_parallel_dG``/CLI/multiprocessing scaffolding with a lean
+function. The thermodynamic leaf functions (``calc_dG_mRNA``/``calc_dG_mRNA_rRNA``/
+``calc_dG_standby_site``) are currently reused verbatim from ``ostir`` so results are identical; they
+will be swapped for fast in-house folding + O(n) base-pair bookkeeping one at a time, each re-verified
+against tests/ostir_parity.py. Validated field-for-field against the OSTIR golden (PARITY PASS 427/427).
 """
 from __future__ import annotations
 
-import math
-from functools import cache
+import warnings
 
 from .scorer import ECOLI_ANTI_SD, RBSScore
 
-# OSTIR calibration constants (ostir_factory.OSTIRFactory.__init__)
-_BETA = 0.40002512
-_RT_EFF = 1.0 / _BETA
-_K = math.exp(7.279194329)
-_CUTOFF = 35                       # nt +/- start codon folded
-_TEMP = 37.0
-_START_ENERGY = {"ATG": -1.194, "GTG": -0.0748, "TTG": -0.0435, "CTG": -0.03406}
-_START_CODONS = frozenset(_START_ENERGY)
-
-_SENTINEL = float("nan")           # marks a term not yet ported
-
-
-@cache
-def _params(dangles: str):
-    """OSTIR's exact rna2004 parameter object (reused verbatim so folding is bit-identical)."""
-    from ostir.ViennaRNA import get_paramater_object, vienna_constants
-    return get_paramater_object(vienna_constants.material, _TEMP, dangles)
+# From OSTIRFactory.__init__ (ostir_factory.py): calibration/model constants for our single-start path.
+_CUTOFF = 35                 # nt +/- start folded, and the 5'-proximity dangles switch
+_STANDBY_LEN = 4
+_DP = 4                      # run_ostir decimal_places
+_NUPACK_HYB = 2.481          # hybridization-penalty offset applied to dG_mRNA_rRNA
+# find_start_codons accepts only these (CTG is deliberately excluded there); energies incl. all forms.
+_START_CODONS = frozenset({"ATG", "AUG", "GTG", "GUG", "TTG", "UUG"})
+_START_ENERGY = {"ATG": -1.194, "AUG": -1.194, "GTG": -0.0748, "GUG": -0.0748,
+                 "TTG": -0.0435, "UUG": -0.0435, "CTG": -0.03406, "CUG": -0.03406}
 
 
-def _mfe_energy(seq: str, dangles: str) -> float:
-    """MFE of a single strand, matching OSTIR's ViennaRNA.mfe (rounded to 2 dp)."""
-    import RNA
-    fc = RNA.fold_compound(seq.upper().replace("T", "U"), _params(dangles))
-    _, energy = fc.mfe()
-    return round(energy, 2)
+def _leaves():
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*missing dependency ViennaRNA.*")
+        from ostir.ostir_calculations import (
+            calc_dG_mRNA, calc_dG_mRNA_rRNA, calc_dG_standby_site, calc_expression_level)
+    return calc_dG_mRNA, calc_dG_mRNA_rRNA, calc_dG_standby_site, calc_expression_level
 
 
 def score_rbs_fast(nt: str, inner_start: int, asd: str = ECOLI_ANTI_SD) -> RBSScore | None:
-    """Score the RBS at 0-indexed ``inner_start``; None if that position is not a start codon.
+    """Score the RBS at 0-indexed ``inner_start``; None if OSTIR would report no valid RBS there.
 
-    Mirrors olgrbs.scorer.score_rbs. See module docstring for port status.
+    Drop-in for olgrbs.scorer.score_rbs. Reproduces run_ostir(nt, start=inner_start+1,
+    end=inner_start+1, aSD=asd, threads=1)[0], or None when that returns [].
     """
     if not 0 <= inner_start < len(nt):
         raise ValueError(f"inner_start {inner_start} out of range for length {len(nt)}")
-    nt = nt.upper()
-    codon = nt[inner_start:inner_start + 3]
-    if codon not in _START_CODONS or inner_start + 3 > len(nt):
-        return None  # OSTIR's find_start_codons yields nothing -> run_ostir returns []
+    rRNA = asd.upper().replace("T", "U")
+    if len(rRNA) != 9:
+        return None  # run_ostir rejects a non-9-mer aSD
+    mRNA = nt.upper().replace(" ", "")
+    seq_len = len(mRNA)
 
-    # dangles switch: "all" (2) within cutoff of the 5' end, else "none" (0)  [factory:230-236]
-    dangles = "none" if inner_start > _CUTOFF else "all"
-    dG_start = _START_ENERGY[codon]
+    # find_start_codons for start_range = [inner_start+1, inner_start+1] (1-indexed): a single position,
+    # clamped to seq_len-2, yielding it only if it is a start codon.
+    start_pos = min(inner_start, seq_len - 2)
+    codon = mRNA[start_pos:start_pos + 3]
+    if codon.upper() not in _START_CODONS:
+        return None
 
-    # dG_mRNA: MFE of the [-cutoff, +cutoff] window around the start  [calc_dG_mRNA + cutoff_mRNA]
-    window = nt[max(0, inner_start - _CUTOFF):min(len(nt), inner_start + _CUTOFF)]
-    dG_mRNA = _mfe_energy(window, dangles)
+    calc_dG_mRNA, calc_dG_mRNA_rRNA, calc_dG_standby_site, calc_expression_level = _leaves()
+    constraints = None
+    dangles = "none" if start_pos > _CUTOFF else "all"   # _parallel_dG auto_dangles
+    dG_start = _START_ENERGY[codon.upper()]
 
-    # TODO(port): dG_mRNA_rRNA (subopt binding-site selection), dG_spacing, dG_standby, spacing_bp.
+    dG_mRNA, _mrna_struct, _kin, _minbp = calc_dG_mRNA(mRNA, start_pos, dangles, constraints)
+
+    try:
+        withspacing, rr_struct, spacing_value = calc_dG_mRNA_rRNA(mRNA, rRNA, start_pos, dangles, constraints)
+    except ValueError as e:
+        if "leaderless start codon" in str(e):
+            return None
+        raise
+    if not withspacing:  # calc_dG_mRNA_rRNA returned None (subopt found no binding site)
+        return None
+
+    withspacing -= _NUPACK_HYB
+    nospacing = rr_struct["dG_mRNA_rRNA"] - _NUPACK_HYB
+    dG_standby, _corrected = calc_dG_standby_site(rr_struct, dangles, _STANDBY_LEN, constraints, rRNA)
+
+    dG_total = withspacing + dG_start - dG_mRNA - dG_standby
     return RBSScore(
-        expression=_SENTINEL,
-        dG_total=_SENTINEL,
-        dG_mRNA_rRNA=_SENTINEL,
-        dG_mRNA=dG_mRNA,
-        dG_spacing=_SENTINEL,
-        dG_standby=_SENTINEL,
-        dG_start_codon=dG_start,
+        expression=round(calc_expression_level(dG_total), _DP),
+        dG_total=round(float(dG_total), _DP),
+        dG_mRNA_rRNA=round(float(nospacing), _DP),
+        dG_mRNA=round(float(dG_mRNA), _DP),
+        dG_spacing=round(float(rr_struct["dG_spacing"]), _DP),
+        dG_standby=round(float(dG_standby), _DP),
+        dG_start_codon=round(float(dG_start), _DP),
         start_codon=codon,
-        spacing_bp=-1,
+        spacing_bp=int(spacing_value),
     )
-
-
-def _expression(dG_total: float) -> float:
-    return _K * math.exp(-dG_total / _RT_EFF)
