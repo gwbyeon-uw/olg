@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -103,6 +104,8 @@ def _cmp(gold, got) -> list[str]:
         elif f == "spacing_bp":
             if int(gv) != int(cv):
                 diffs.append(f"{f}: {gv} != {cv}")
+        elif not math.isfinite(cv):  # NaN/inf never silently passes a numeric tolerance
+            diffs.append(f"{f}: golden {gv:.6g} vs non-finite {cv!r}")
         elif f == "expression":
             ad = abs(gv - cv); rd = ad / max(abs(gv), 1e-12)
             if ad > ABS_TOL[f] and rd > REL_TOL_EXPR:
