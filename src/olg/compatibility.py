@@ -49,6 +49,10 @@ class CodonCompatibility:
         #Dictionary that stores compatible next/previous quartets given the current quartet
         self.compatible_prev_quartets = [ torch.tensor(v).unique() for v in Constants.QUARTETS_P ]
         self.compatible_next_quartets = [ torch.tensor(v).unique() for v in Constants.QUARTETS_N ]
+        # Stacked (256, 64) forms for batched indexing in decode_next's neighbor propagation
+        # (all rows are uniform length 64), avoiding a per-step Python loop + .item() syncs.
+        self.compatible_prev_quartets_t = torch.stack(self.compatible_prev_quartets)
+        self.compatible_next_quartets_t = torch.stack(self.compatible_next_quartets)
 
         self.codon_compatibility_start_mask = [None, None]
         self.start_codons_quartets = [[], []]
