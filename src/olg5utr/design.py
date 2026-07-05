@@ -89,9 +89,12 @@ class UTRDesign:
 
 
 def dna_to_onehot(seqs: list[str], length: int, device: torch.device | None = None) -> torch.Tensor:
-    """List of DNA strings -> ``(N, 4, length)`` one-hot (ACGT order)."""
-    oh = torch.zeros(len(seqs), 4, length, device=device)
-    for b, s in enumerate(seqs):
-        for i, ch in enumerate(s[:length]):
-            oh[b, _BASE[ch], i] = 1.0
-    return oh
+    """List of DNA strings -> ``(N, 4, length)`` one-hot (ACGT order).
+
+    Builds the index array on CPU and scatters once, then a single host->device transfer — avoids
+    N*length scalar writes into a device tensor. All sequences must be at least ``length`` long.
+    """
+    idx = torch.tensor([[_BASE[ch] for ch in s[:length]] for s in seqs], dtype=torch.long)  # (N, L) CPU
+    oh = torch.zeros(len(seqs), 4, length)
+    oh.scatter_(1, idx.unsqueeze(1), 1.0)
+    return oh.to(device) if device is not None else oh

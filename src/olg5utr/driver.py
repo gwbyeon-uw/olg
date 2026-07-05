@@ -102,10 +102,14 @@ def optimize_utr(
     for _ in range(steps):
         prop = [_propose(cur[b], design, syn, rng) for b in range(n_parallel)]
         prop_c = score_batch(prop)
+        deltas = (prop_c - cur_c).flatten().tolist()   # single GPU->CPU sync (was one float() per candidate)
+        # rng.random() is drawn in candidate order exactly as before (only when d<=0 and tau>0).
+        accept = [d > 0 or (tau > 0 and math.exp(d / tau) > rng.random()) for d in deltas]  # greedy / Metropolis
         for b in range(n_parallel):
-            d = float(prop_c[b] - cur_c[b])
-            if d > 0 or (tau > 0 and math.exp(d / tau) > rng.random()):   # greedy / Metropolis
-                cur[b], cur_c[b] = prop[b], prop_c[b]
+            if accept[b]:
+                cur[b] = prop[b]
+        accept_t = torch.tensor(accept, device=cur_c.device).reshape(cur_c.shape)
+        cur_c = torch.where(accept_t, prop_c, cur_c)
 
     order = sorted(range(n_parallel), key=lambda b: float(cur_c[b]), reverse=True)[:top]
     candidates = [
