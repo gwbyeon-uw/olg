@@ -128,10 +128,11 @@ def _anneal(chain, score_nt, key, steps, restarts, seed):
         cur_val = key(cur) if cur else -math.inf
         yield cur_nt
         for step in range(steps):
-            nbrs = list(chain.neighbors(path))
-            if not nbrs:
+            moves = list(chain.neighbor_moves(path))   # (i,q) pairs; same order/count as neighbors()
+            if not moves:
                 break
-            cand_path = rng.choice(nbrs)
+            i, q = rng.choice(moves)                    # same rng draw -> same neighbour as before
+            cand_path = path[:i] + [q] + path[i + 1:]
             cand_nt = chain.to_nt(cand_path)
             sc = score_nt(cand_nt)
             if sc is None:
