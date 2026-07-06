@@ -270,7 +270,9 @@ class OLGDesign():
                 q_n = torch.unique(self.compatibility.next_quartet_index[self.quartet_list[t_q_n]]) #First nucleotide of the previous quartets
 
         #All possible combinations of first and last NUCLEOTIDES; would be 4x4=16 if no previous/next positions were decoded
-        p_n = torch.cartesian_prod(q_p, q_n)
+        # q_p/q_n may be on different devices (the [0,1,2,3] default is on config.device; the
+        # torch.unique(prev/next_quartet_index[...]) branch is CPU), so align before cartesian_prod.
+        p_n = torch.cartesian_prod(q_p.to(self.config.device), q_n.to(self.config.device))
 
         apply_start1 = self.config.protein1.force_start and (t_f1 == self.config.protein1.start_offset)
         apply_start2 = self.config.protein2.force_start and (t_f2 == self.config.protein2.start_offset)
