@@ -309,8 +309,9 @@ class OLGDesign():
             compat *= fixed_mask
 
         compat_bool = compat.bool()   #True where a quartet is compatible
-        compatibility = ~compat_bool  #incompatible mask, kept for errored_compat
-        # Broadcast joint logits over the quartet dim; incompatible quartets -> MIN_LOGIT (clamp folded in).
+        compatibility = ~compat_bool  #incompatible mask, retained for errored_compat below
+        # Mask incompatible quartets to MIN_LOGIT, broadcasting the joint logits over the quartet dim;
+        # the clamp keeps compatible logits from underflowing below MIN_LOGIT.
         masked_logits_joint = torch.where(
             compat_bool, logits_joint.clamp(min=Constants.MIN_LOGIT).unsqueeze(-1), Constants.MIN_LOGIT)
         

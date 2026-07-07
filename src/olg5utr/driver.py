@@ -102,8 +102,8 @@ def optimize_utr(
     for _ in range(steps):
         prop = [_propose(cur[b], design, syn, rng) for b in range(n_parallel)]
         prop_c = score_batch(prop)
-        deltas = (prop_c - cur_c).flatten().tolist()   # single GPU->CPU sync (was one float() per candidate)
-        # rng.random() is drawn in candidate order exactly as before (only when d<=0 and tau>0).
+        deltas = (prop_c - cur_c).flatten().tolist()   # one GPU->CPU sync for the whole batch
+        # rng.random() is drawn in candidate order, only when d<=0 and tau>0 (Metropolis).
         accept = [d > 0 or (tau > 0 and math.exp(d / tau) > rng.random()) for d in deltas]  # greedy / Metropolis
         for b in range(n_parallel):
             if accept[b]:

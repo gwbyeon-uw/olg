@@ -1,11 +1,11 @@
-"""Fast reimplementation of the OSTIR RBS scorer for the single-sequence / single-start-codon case.
+"""Alternative OSTIR RBS scorer specialized to the single-sequence / single-start-codon case.
 
-Purpose-built control layer for one mRNA window + one start codon, replacing OSTIR's
-``OSTIRFactory``/``find_start_codons``/``_parallel_dG``/CLI/multiprocessing scaffolding with a lean
-function. The thermodynamic leaf functions (``calc_dG_mRNA``/``calc_dG_mRNA_rRNA``/
-``calc_dG_standby_site``) are currently reused verbatim from ``ostir`` so results are identical; they
-will be swapped for fast in-house folding + O(n) base-pair bookkeeping one at a time, each re-verified
-against tests/ostir_parity.py. Validated field-for-field against the OSTIR golden (PARITY PASS 427/427).
+A lean control layer for one mRNA window + one start codon that replaces OSTIR's
+``OSTIRFactory``/``find_start_codons``/``_parallel_dG``/CLI/multiprocessing scaffolding. ``dG_mRNA`` is
+computed directly (windowed MFE); ``dG_mRNA_rRNA`` and ``dG_standby`` reuse OSTIR's own thermodynamic
+leaf functions, so scores match ``ostir.run_ostir`` field-for-field (PARITY PASS 427/427 against
+tests/ostir_parity.py). It reuses the same ViennaRNA folding, so it is a drop-in for
+``olgrbs.scorer.score_rbs`` but not a speedup; kept as the validated parity reference.
 """
 from __future__ import annotations
 
