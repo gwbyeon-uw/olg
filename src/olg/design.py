@@ -344,9 +344,8 @@ class OLGDesign():
         topp_v = sort_v[0:cutoff_ind]
         selected = torch.multinomial(topp_v, 1) #Sampling
         
-        best_q = torch.where(masked_logits_joint == sort_v_[selected]) 
-        
-        #TODO: Add quartet bias (to favor some quartets over others)
+        best_q = torch.where(masked_logits_joint == sort_v_[selected])
+
         if overlapping_t: #If in overlapping region
             best_q_aa = torch.unique(torch.stack([best_q[1], best_q[2]]), dim=1)
             if (best_q_aa.shape[1] > 1): #In case there is multiple equally likely amino acids, randomly choose a pair

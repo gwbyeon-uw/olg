@@ -8,7 +8,7 @@ tight/loose spacing, no-SD, leaderless). ``tests/golden_ostir.json`` is the comm
 
   python tests/ostir_parity.py                 # self-check: score_rbs vs the committed golden
   python tests/ostir_parity.py --save          # regenerate the golden (only when OSTIR itself changes)
-  python tests/ostir_parity.py --check olgrbs.scorer_fast.score_rbs_fast   # diff a candidate scorer
+  python tests/ostir_parity.py --check mymodule.my_score_rbs   # diff a candidate scorer vs the golden
 
 A candidate has the score_rbs signature: fn(nt:str, inner_start:int, asd:str) -> RBSScore | None.
 """
