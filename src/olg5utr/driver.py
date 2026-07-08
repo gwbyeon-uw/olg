@@ -1,10 +1,10 @@
 """optimize_utr — discrete search over the synonymous + free-5'UTR space, scored by Optimus MRL.
 
 Mirrors olgrbs's driver shape (entry point + Candidate/Result dataclasses). Batched single-move greedy
-(near-greedy Metropolis with tau>0), N sequences in parallel, one Optimus forward per step. Every move
-is protein-preserving by construction (free region = any base; outer CDS = synonymous codon swap), so
-no protein loss / differentiable translator is needed. See analysis/gd_vs_sampling_pilot for why
-discrete beats gradient descent here (+22% MRL).
+(near-greedy Metropolis with tau>0), N sequences in parallel, two Optimus forwards per step (outer and
+inner 5'UTR). Every move is protein-preserving by construction (free region = any base; outer CDS =
+synonymous codon swap), so no protein loss / differentiable translator is needed. Discrete search is
+used here rather than gradient descent.
 """
 from __future__ import annotations
 

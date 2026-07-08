@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""OSTIR parity validator — the ground truth any RBS-scoring reimplementation must reproduce.
+"""OSTIR parity validator — regression guard for the OSTIR RBS scorer (score_rbs), and a parity
+harness for any candidate scorer via ``--check``.
 
 Snapshots the full RBSScore (expression + every ΔG component term) that the current
 ``ostir.run_ostir`` path produces, over a representative set of fold windows: the real windows

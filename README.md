@@ -483,7 +483,7 @@ print(best.score.combined, best.score.mrl_outer, best.score.mrl_inner)
 
 | `optimize_utr` parameter | Default | Description |
 |-----------|---------|-------------|
-| `n_parallel` | `50` | independent search trajectories (batched — one Optimus forward per step) |
+| `n_parallel` | `50` | independent search trajectories (scored in parallel — two Optimus forwards per step, outer + inner) |
 | `steps` | `4000` | single-move steps per trajectory |
 | `tau` | `0.0` | acceptance temperature: `0` = greedy hill-climb, `>0` = Metropolis (escapes local optima) |
 | `top` | `20` | ranked candidates returned |

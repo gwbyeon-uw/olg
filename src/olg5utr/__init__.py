@@ -3,7 +3,7 @@
 The eukaryotic counterpart of ``olgrbs`` (bacterial RBS/OSTIR): given an outer protein and a free 5'
 region, design the shared 5'UTR to maximize translation (mean ribosome load) of BOTH overlapping ORFs,
 keeping the outer protein fixed up to synonymous codon choice. Uses discrete search (not gradient
-descent) — see analysis/gd_vs_sampling_pilot for the rationale.
+descent).
 
     from olg5utr import UTRDesign, load_optimus, optimize_utr
     model  = load_optimus("weights/optimus_mrl_multi.pth", device)
