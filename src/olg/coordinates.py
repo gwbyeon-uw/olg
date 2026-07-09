@@ -1,7 +1,7 @@
 """Coordinate maps between an OLG's absolute quartet positions and each frame's residue positions.
 
-``Coordinates`` precomputes the position mappings (all <-> frame1/frame2), the overlap / start / stop /
-fixed-position masks, and the decoding-order helpers used throughout decoding.
+``Coordinates`` precomputes the position mappings (all <-> frame1/frame2) and the overlap / start /
+stop / fixed-position masks that drive decoding-order priority.
 """
 import torch
 

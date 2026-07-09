@@ -2,8 +2,8 @@
 
 Decodes both reading frames of an OLG one quartet position at a time, masking each step to the codons
 compatible with both frames' amino acids (via ``CodonCompatibility``) and sampling from the joint
-per-frame logits produced by the attached decoder wrappers. Emits the designed nucleotide sequence and
-both proteins.
+distribution formed from the per-frame logits produced by the attached decoder wrappers. Emits the
+designed nucleotide sequence and both proteins.
 """
 import copy
 import math
@@ -274,7 +274,7 @@ class OLGDesign():
         q_n = torch.tensor([0, 1, 2, 3], device=self.config.device).long() #To allow all last nucleotide if next position was not decoded yet
         if t_q_n is not None:
             if self.quartet_list[t_q_n] is not None:
-                q_n = torch.unique(self.compatibility.next_quartet_index[self.quartet_list[t_q_n]]) #First nucleotide of the previous quartets
+                q_n = torch.unique(self.compatibility.next_quartet_index[self.quartet_list[t_q_n]]) #First nucleotide of the next quartets
 
         #All possible combinations of first and last NUCLEOTIDES; would be 4x4=16 if no previous/next positions were decoded
         # q_p/q_n may be on different devices (the [0,1,2,3] default is on config.device; the
