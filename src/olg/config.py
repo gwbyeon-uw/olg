@@ -1,3 +1,9 @@
+"""Configuration for an OLG design run.
+
+``ProteinConfig`` holds one frame's constraints (length, start/stop, fixed positions, per-position
+biases); ``DesignConfig`` bundles both frames plus the arrangement, offset, genetic code, and device.
+Both load from and round-trip to plain dicts (YAML-friendly).
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields

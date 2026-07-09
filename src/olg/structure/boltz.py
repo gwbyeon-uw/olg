@@ -1,3 +1,8 @@
+"""Boltz-2 structure-prediction wrapper for OLG designs.
+
+Builds model inputs (sequences, MSA, pocket conditioning), runs Boltz co-folding, and parses the
+predicted structures — used by the structure-conditioned design paths.
+"""
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from typing import Literal, Optional, Dict

@@ -1,3 +1,9 @@
+"""Shared constants and lookup tables for OLG design.
+
+``Arrangement`` (the supported reading-frame overlaps), ``DecodingMode``, the quartet <-> codon <->
+amino-acid tables, and ``build_restricted_codon_table`` (a genetic code specialized to a custom
+alphabet split, e.g. gene serine -> J).
+"""
 from typing import Dict, List
 from enum import IntEnum
 import itertools

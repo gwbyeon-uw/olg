@@ -1,3 +1,10 @@
+"""OLGDesign — the iterative overlapping-gene decoder.
+
+Decodes both reading frames of an OLG one quartet position at a time, masking each step to the codons
+compatible with both frames' amino acids (via ``CodonCompatibility``) and sampling from the joint
+per-frame logits produced by the attached decoder wrappers. Emits the designed nucleotide sequence and
+both proteins.
+"""
 import copy
 import math
 from typing import Dict, Tuple, List, Optional, Any
