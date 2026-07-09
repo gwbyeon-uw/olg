@@ -57,7 +57,7 @@ class RBSResult:
 
 def optimize_rbs(design, *, objective="max", open_overlap=True, asd=ECOLI_ANTI_SD,
                  w_up=13, w_down=13, enumerate_cap=100_000, sa_steps=2000, sa_restarts=5,
-                 seed=0, top=20) -> RBSResult:
+                 seed=0, top=20, patience=None) -> RBSResult:
     """Design the inner gene's RBS. ``objective`` is "max" or a target expression value.
 
     Returns ranked candidates (best-first by the objective), each protein-preserving by
@@ -65,6 +65,8 @@ def optimize_rbs(design, *, objective="max", open_overlap=True, asd=ECOLI_ANTI_S
     ``w_up``/``w_down`` (≥12) cover OSTIR's ±35 fold window so scores are base-independent.
     ``open_overlap=True`` (default) also samples the inner CDS's dual-synonymous freedom — free
     where dual-coding is frozen (the common case), useful where it isn't; only synonymous AMP changes.
+    ``patience`` (anneal only): stop early once ``patience`` scored moves pass with no improvement to
+    the best objective (per-run convergence detection); ``None`` disables it (run the full ``sa_steps``).
     """
     window = rbs_window(design, w_up=w_up, w_down=w_down)
     chain = build_chain(design, window, open_overlap=open_overlap, seed=seed)
@@ -101,6 +103,7 @@ def optimize_rbs(design, *, objective="max", open_overlap=True, asd=ECOLI_ANTI_S
         nts = _anneal(chain, score_nt, key, sa_steps, sa_restarts, seed)
 
     best_by_fold: dict[str, tuple[str, RBSScore]] = {}
+    best_key, since_improve = -math.inf, 0     # anneal early-stop: moves since the best objective improved
     for nt in nts:
         sc = score_nt(nt)
         if sc is None:
@@ -108,6 +111,14 @@ def optimize_rbs(design, *, objective="max", open_overlap=True, asd=ECOLI_ANTI_S
         fold = nt[lo:s + _FOLD_MARGIN + 3]
         if fold not in best_by_fold:
             best_by_fold[fold] = (nt, sc)
+        if patience is not None and method == "anneal":
+            k = key(sc)
+            if k > best_key:
+                best_key, since_improve = k, 0
+            else:
+                since_improve += 1
+                if since_improve >= patience:
+                    break                       # converged (hard cap remains sa_steps x sa_restarts)
 
     scored = sorted(best_by_fold.values(), key=lambda ns: key(ns[1]), reverse=True)
     base_sc = score_nt(base_nt)
