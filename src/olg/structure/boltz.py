@@ -531,7 +531,6 @@ class InputDataBuilder:
             data["sequences"], key=lambda entry: list(entry.values())[0]["id"][0]
         )
 
-        print("Data dictionary:\n", data)
         return data, pocket_conditioning
 
 
