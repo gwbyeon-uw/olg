@@ -431,7 +431,7 @@ for i in range(n_cycles):
 
 ## RBS design (olgrbs)
 
-`olgrbs` optimizes the **inner** gene's ribosome binding site directly on an `olg` `OLGDesign`. It walks the outer protein's synonymous space (plus the overlap's dual-coding freedom), scores each candidate with [OSTIR](https://github.com/barricklab/ostir) (the Salis 2009 ΔG model), and returns candidates that are **protein-preserving by construction** — the outer CDS translation never changes, and only synonymous inner-CDS changes are made in the overlap. It picks exact enumeration vs. simulated annealing automatically, by the (cheap) count of reachable fold windows.
+`olgrbs` optimizes the **inner** gene's ribosome binding site directly on an `olg` `OLGDesign`. It walks the outer protein's synonymous space (plus the overlap's dual-coding freedom), scores each candidate with [OSTIR](https://github.com/barricklab/ostir) (the Salis 2009 ΔG model), and returns candidates that are **protein-preserving by construction** — the outer CDS translation never changes, and only synonymous inner-CDS changes are made in the overlap. It picks exact enumeration vs. simulated annealing automatically, by the (cheap) count of reachable quartet paths.
 
 ```python
 from olgrbs import optimize_rbs, score_rbs, rbs_window
@@ -483,7 +483,7 @@ print(best.score.combined, best.score.mrl_outer, best.score.mrl_inner)
 
 | `optimize_utr` parameter | Default | Description |
 |-----------|---------|-------------|
-| `n_parallel` | `50` | independent search trajectories (batched — one Optimus forward per step) |
+| `n_parallel` | `50` | independent search trajectories (scored in parallel — two Optimus forwards per step, outer + inner) |
 | `steps` | `4000` | single-move steps per trajectory |
 | `tau` | `0.0` | acceptance temperature: `0` = greedy hill-climb, `>0` = Metropolis (escapes local optima) |
 | `top` | `20` | ranked candidates returned |

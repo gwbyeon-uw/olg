@@ -1,7 +1,6 @@
 """Quartet-compatibility & reachability for OLG co-design feasibility.
 
-Canonical home (previously vendored per-experiment as olg_design.feasibility). Given an
-arrangement + codon table, precomputes which quartets encode each (essential_aa, overlap_aa)
+Given an arrangement + codon table, precomputes which quartets encode each (essential_aa, overlap_aa)
 pair / overlap codon for cheap start/stop/AA checks, and samples co-design-realizable sequences
 (and their quartet paths, via sample_codesign_paths) by reachability over the quartet NT chain.
 """

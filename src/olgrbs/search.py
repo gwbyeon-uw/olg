@@ -40,6 +40,7 @@ class OptionChain:
     base_quartets: list[int]      # full resolved chain (window spliced in to make candidates)
     base_path: list[int]          # base assignment restricted to the window positions
     inner_start_nt: int
+    _base_nt: str | None = None   # cached full base NT (window positions are contiguous, spliced in to_nt)
 
     # ---- search-ladder primitives -------------------------------------------------
     def count(self) -> int:
@@ -70,22 +71,38 @@ class OptionChain:
             seen.add(self.to_nt(path))
         return list(seen)
 
-    def neighbors(self, path: list[int]):
-        """Connected single-position moves from ``path`` (for SA): one quartet swapped, still valid."""
+    def neighbor_moves(self, path: list[int]):
+        """Connected single-position moves as ``(i, q)`` pairs (one quartet swapped, still valid).
+
+        Yields the move, not a spliced path — the SA caller materializes only the chosen one, avoiding
+        a full-length path allocation per candidate neighbour.
+        """
         last = len(path) - 1
         for i, options in enumerate(self.reach):
             for q in options:
                 if q == path[i]:
                     continue
                 if (i == 0 or path[i - 1] in _PREV[q]) and (i == last or path[i + 1] in _NEXT[q]):
-                    yield path[:i] + [q] + path[i + 1:]
+                    yield i, q
+
+    def neighbors(self, path: list[int]):
+        """Connected single-position moves from ``path`` (for SA): one quartet swapped, still valid."""
+        for i, q in self.neighbor_moves(path):
+            yield path[:i] + [q] + path[i + 1:]
 
     def to_nt(self, path: list[int]) -> str:
-        """Splice a window path into the base chain and decode to NT."""
-        q = list(self.base_quartets)
-        for pos, qi in zip(self.positions, path):
-            q[pos] = qi
-        return decode_path(q)
+        """Splice a window path into the base chain and decode to NT.
+
+        The window positions are contiguous, so only the window's codons are decoded and spliced into
+        a cached full base NT — avoiding a full base_quartets copy + re-decode of unchanged quartets.
+        """
+        if self._base_nt is None:
+            self._base_nt = decode_path(self.base_quartets)
+        w0, w1, n = self.positions[0], self.positions[-1] + 1, len(self.base_quartets)
+        window = "".join(Constants.QUARTETS[qi][:3] for qi in path)
+        if w1 < n:  # boundary NT lies outside the window -> suffix (incl. boundary) is unchanged
+            return self._base_nt[:3 * w0] + window + self._base_nt[3 * w1:]
+        return self._base_nt[:3 * w0] + window + Constants.QUARTETS[path[-1]][3]  # window ends the chain
 
     # ---- internals ----------------------------------------------------------------
     def _enumerate_paths(self):

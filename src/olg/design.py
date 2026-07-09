@@ -1,3 +1,10 @@
+"""OLGDesign — the iterative overlapping-gene decoder.
+
+Decodes both reading frames of an OLG one quartet position at a time, masking each step to the codons
+compatible with both frames' amino acids (via ``CodonCompatibility``) and sampling from the joint
+distribution formed from the per-frame logits produced by the attached decoder wrappers. Emits the
+designed nucleotide sequence and both proteins.
+"""
 import copy
 import math
 from typing import Dict, Tuple, List, Optional, Any
@@ -267,10 +274,12 @@ class OLGDesign():
         q_n = torch.tensor([0, 1, 2, 3], device=self.config.device).long() #To allow all last nucleotide if next position was not decoded yet
         if t_q_n is not None:
             if self.quartet_list[t_q_n] is not None:
-                q_n = torch.unique(self.compatibility.next_quartet_index[self.quartet_list[t_q_n]]) #First nucleotide of the previous quartets
+                q_n = torch.unique(self.compatibility.next_quartet_index[self.quartet_list[t_q_n]]) #First nucleotide of the next quartets
 
         #All possible combinations of first and last NUCLEOTIDES; would be 4x4=16 if no previous/next positions were decoded
-        p_n = torch.tensor([ (p, n) for p in q_p for n in q_n ]).long()
+        # q_p/q_n may be on different devices (the [0,1,2,3] default is on config.device; the
+        # torch.unique(prev/next_quartet_index[...]) branch is CPU), so align before cartesian_prod.
+        p_n = torch.cartesian_prod(q_p.to(self.config.device), q_n.to(self.config.device))
 
         apply_start1 = self.config.protein1.force_start and (t_f1 == self.config.protein1.start_offset)
         apply_start2 = self.config.protein2.force_start and (t_f2 == self.config.protein2.start_offset)
@@ -306,18 +315,19 @@ class OLGDesign():
             fixed_mask[compatible_q_i] = 1
             compat *= fixed_mask
 
-        compatibility = (~(compat.bool())) #True where a quartet is incompatible, i.e. to be masked out
-        
-        quartets_logits_joint = logits_joint.repeat(compatibility.shape[0], 1, 1).unsqueeze(3).repeat(1, 1, 1, Constants.QUARTET_SIZE) #Joint logits, repeated so that we can mask with compatibility matrix
-        quartets_logits_joint[compatibility] = Constants.MIN_LOGIT #Mask joint logits matrix with compatibility matrix
-        masked_logits_joint = torch.clamp(quartets_logits_joint, min=Constants.MIN_LOGIT)
+        compat_bool = compat.bool()   #True where a quartet is compatible
+        compatibility = ~compat_bool  #incompatible mask, retained for errored_compat below
+        # Mask incompatible quartets to MIN_LOGIT, broadcasting the joint logits over the quartet dim;
+        # the clamp keeps compatible logits from underflowing below MIN_LOGIT.
+        masked_logits_joint = torch.where(
+            compat_bool, logits_joint.clamp(min=Constants.MIN_LOGIT).unsqueeze(-1), Constants.MIN_LOGIT)
         
         if masked_logits_joint.max() == Constants.MIN_LOGIT: #Invalid case
             if force_safe:
-                compatibility_safe = (~(compat_safe.bool()))
-                quartets_logits_joint = logits_joint_safe.repeat(compatibility_safe.shape[0], 1, 1).unsqueeze(3).repeat(1, 1, 1, Constants.QUARTET_SIZE)
-                quartets_logits_joint[compatibility_safe] = Constants.MIN_LOGIT #Mask joint logits matrix with compatibility matrix
-                masked_logits_joint = torch.clamp(quartets_logits_joint, min=Constants.MIN_LOGIT)
+                compat_safe_bool = compat_safe.bool()
+                compatibility_safe = ~compat_safe_bool
+                masked_logits_joint = torch.where(
+                    compat_safe_bool, logits_joint_safe.clamp(min=Constants.MIN_LOGIT).unsqueeze(-1), Constants.MIN_LOGIT)
                 if masked_logits_joint.max() == Constants.MIN_LOGIT: #Even the relaxed constraints admit nothing
                     self.errored_compat = compatibility_safe
                     self.errored_next_q = self.next_q
@@ -341,9 +351,8 @@ class OLGDesign():
         topp_v = sort_v[0:cutoff_ind]
         selected = torch.multinomial(topp_v, 1) #Sampling
         
-        best_q = torch.where(masked_logits_joint == sort_v_[selected]) 
-        
-        #TODO: Add quartet bias (to favor some quartets over others)
+        best_q = torch.where(masked_logits_joint == sort_v_[selected])
+
         if overlapping_t: #If in overlapping region
             best_q_aa = torch.unique(torch.stack([best_q[1], best_q[2]]), dim=1)
             if (best_q_aa.shape[1] > 1): #In case there is multiple equally likely amino acids, randomly choose a pair
@@ -394,25 +403,25 @@ class OLGDesign():
         
         #Check that previous position quartets are compatible with current position quartets. This has to be recursive, since choice at each position affects its neighbors
         if (t_q_p is not None) and (self.quartet_list[t_q_p] is not None):
-            compatible_prev = np.intersect1d(self.quartet_list[t_q_p], torch.stack([ self.compatibility.compatible_prev_quartets[q.item()] for q in best_q[3] ]).flatten().unique().cpu())
+            compatible_prev = np.intersect1d(self.quartet_list[t_q_p], self.compatibility.compatible_prev_quartets_t[best_q[3].long()].flatten().unique().cpu())
             self.quartet_list[t_q_p] = compatible_prev
             
             #Recursively check all quartets connected to it
             t_q_p_i = t_q_p - 1
             while (t_q_p_i >= 0) and (self.quartet_list[t_q_p_i] is not None) and (self.quartet_list[t_q_p_i].shape[0] > 1):
-                compatible_prev = np.intersect1d(self.quartet_list[t_q_p_i], torch.stack([ self.compatibility.compatible_prev_quartets[q.item()] for q in self.quartet_list[t_q_p_i+1]]).flatten().unique().cpu())
+                compatible_prev = np.intersect1d(self.quartet_list[t_q_p_i], self.compatibility.compatible_prev_quartets_t[torch.as_tensor(self.quartet_list[t_q_p_i+1], dtype=torch.long)].flatten().unique().cpu())
                 self.quartet_list[t_q_p_i] = compatible_prev
                 t_q_p_i -= 1
         
         #Check that next position quartets are compatible with current position quartets
         if (t_q_n is not None) and (self.quartet_list[t_q_n] is not None):
-            compatible_next = np.intersect1d(self.quartet_list[t_q_n], torch.stack([ self.compatibility.compatible_next_quartets[q.item()] for q in best_q[3] ]).flatten().unique().cpu())
+            compatible_next = np.intersect1d(self.quartet_list[t_q_n], self.compatibility.compatible_next_quartets_t[best_q[3].long()].flatten().unique().cpu())
             self.quartet_list[t_q_n] = compatible_next
             
             #Recursively check all quartets connected to it
             t_q_n_i = t_q_n + 1
             while (t_q_n_i < self.coords.total_len) and (self.quartet_list[t_q_n_i] is not None) and (self.quartet_list[t_q_n_i].shape[0] > 1):
-                compatible_next = np.intersect1d(self.quartet_list[t_q_n_i], torch.stack([ self.compatibility.compatible_next_quartets[q.item()] for q in self.quartet_list[t_q_n_i-1]]).flatten().unique().cpu())
+                compatible_next = np.intersect1d(self.quartet_list[t_q_n_i], self.compatibility.compatible_next_quartets_t[torch.as_tensor(self.quartet_list[t_q_n_i-1], dtype=torch.long)].flatten().unique().cpu())
                 self.quartet_list[t_q_n_i] = compatible_next
                 t_q_n_i += 1
         

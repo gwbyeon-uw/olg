@@ -43,7 +43,7 @@ class WrapperEvoDiff(BaseWrapper):
         self.msa_seqs = msa_seqs
         self.msa_n_seq = msa_n_seq # number of sequences in MSA to subsample
         self.msa_max_length = msa_max_length # maximum sequence length to subsample
-        self.seq_len = self.msa_max_length #Set to same as MSA length for now
+        self.seq_len = self.msa_max_length #sequence length tracks the MSA subsample length
         self.msa_selection_type = msa_selection_type # or 'MaxHamming'; MSA subsampling scheme
 
         # Seed numpy's global RNG from rand_base so MSA subsampling is reproducible
@@ -229,8 +229,7 @@ class WrapperEvoDiff(BaseWrapper):
         self.S_msa = torch.full((1, self.msa_n_seq, self.msa_max_length), fill_value=self.tokenizer.mask_id, device=self.device)
         self.S_msa[:, 1:self.msa_n_seq, :self.seq_len] = self.valid_msa[1:self.msa_n_seq, :self.seq_len] #Everything except the first row; first row is the design target and therefore masked (fully, so if part of it needs to be filled prior to OLG decoding, use prefixed_seq)
         self.S_msa[:, :, self.seq_len:] = self.padding #Change mask token to pad token
-        #self.S_msa = self.S_msa.to(self.device) #Will write generated sequences here and used to input to model
-        
+
         self.next_t = 0 #Iteration step; used as index for decoding orders
 
         self.current_pred = None

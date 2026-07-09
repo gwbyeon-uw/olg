@@ -1,10 +1,10 @@
 """optimize_utr — discrete search over the synonymous + free-5'UTR space, scored by Optimus MRL.
 
 Mirrors olgrbs's driver shape (entry point + Candidate/Result dataclasses). Batched single-move greedy
-(near-greedy Metropolis with tau>0), N sequences in parallel, one Optimus forward per step. Every move
-is protein-preserving by construction (free region = any base; outer CDS = synonymous codon swap), so
-no protein loss / differentiable translator is needed. See analysis/gd_vs_sampling_pilot for why
-discrete beats gradient descent here (+22% MRL).
+(near-greedy Metropolis with tau>0), N sequences in parallel, two Optimus forwards per step (outer and
+inner 5'UTR). Every move is protein-preserving by construction (free region = any base; outer CDS =
+synonymous codon swap), so no protein loss / differentiable translator is needed. Discrete search is
+used here rather than gradient descent.
 """
 from __future__ import annotations
 
@@ -102,10 +102,14 @@ def optimize_utr(
     for _ in range(steps):
         prop = [_propose(cur[b], design, syn, rng) for b in range(n_parallel)]
         prop_c = score_batch(prop)
+        deltas = (prop_c - cur_c).flatten().tolist()   # one GPU->CPU sync for the whole batch
+        # rng.random() is drawn in candidate order, only when d<=0 and tau>0 (Metropolis).
+        accept = [d > 0 or (tau > 0 and math.exp(d / tau) > rng.random()) for d in deltas]  # greedy / Metropolis
         for b in range(n_parallel):
-            d = float(prop_c[b] - cur_c[b])
-            if d > 0 or (tau > 0 and math.exp(d / tau) > rng.random()):   # greedy / Metropolis
-                cur[b], cur_c[b] = prop[b], prop_c[b]
+            if accept[b]:
+                cur[b] = prop[b]
+        accept_t = torch.tensor(accept, device=cur_c.device).reshape(cur_c.shape)
+        cur_c = torch.where(accept_t, prop_c, cur_c)
 
     order = sorted(range(n_parallel), key=lambda b: float(cur_c[b]), reverse=True)[:top]
     candidates = [

@@ -373,8 +373,9 @@ class OLGCampaign:
         """Reconstruct the designed OLG and maximize its AMP RBS over FabD-synonymous codons (olgrbs)."""
         from olgrbs import optimize_rbs
         olg = self.reconstruct(arr, off, amp_seq, mut_aa, torch.device("cpu"))
-        base = optimize_rbs(olg).base_expression
         r = optimize_rbs(olg, **dict(scan["rbs_opt"]))
+        base = r.base_expression   # base path depends only on the RNG seed + anti-SD (asd), neither of
+                                   # which the rbs_opt search params change, so no separate run is needed
         if r.best is None:
             return {"rbs_base": round(base, 1), "rbs_rate": None, "rbs_pctile": None,
                     "rbs_xbase": None, "rbs_n_mut": None, "rbs_method": r.method, "rbs_nt": None}

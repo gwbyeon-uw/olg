@@ -27,6 +27,9 @@ def mrl_dual(onehot: torch.Tensor, model, design: UTRDesign) -> tuple[torch.Tens
     """
     outer = F.pad(onehot[:, :, : design.free_len], (MODEL_INPUT_LEN - design.free_len, 0))
     inner = F.pad(onehot[:, :, : design.length], (MODEL_INPUT_LEN - design.length, 0))
+    # Two separate forwards, NOT one batched cat([outer,inner]) forward: on CUDA cuDNN picks a
+    # batch-size-dependent conv algorithm, so batching changes FP reduction order (~1e-3 at N=50) and
+    # deterministically flips accept decisions in optimize_utr. Kept separate for reproducibility.
     mo = model(outer, final_ind=design.head).squeeze(1)
     mi = model(inner, final_ind=design.head).squeeze(1)
     return mo, mi

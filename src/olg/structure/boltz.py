@@ -1,3 +1,11 @@
+"""Boltz-2 structure-prediction wrapper for OLG binder hallucination (adapted from Protein-Hunter).
+
+Builds model inputs (sequences, MSA, pocket conditioning), runs Boltz-2 prediction — monomer fold or
+multi-chain binder hallucination with contact steering — and writes/scores (ipTM) the predicted
+structures. This is the structure half of a Protein-Hunter-style hallucinate <-> ProteinMPNN co-design
+loop: iterate predicting a complex and redesigning the binder, where the redesign step is the OLG frame
+decoder, so the binder stays overlap-constrained (see the README binder co-design example).
+"""
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from typing import Literal, Optional, Dict
@@ -531,7 +539,6 @@ class InputDataBuilder:
             data["sequences"], key=lambda entry: list(entry.values())[0]["id"][0]
         )
 
-        print("Data dictionary:\n", data)
         return data, pocket_conditioning
 
 

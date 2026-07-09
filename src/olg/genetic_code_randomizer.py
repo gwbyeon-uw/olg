@@ -46,7 +46,6 @@ def read_code(fileName):
         for l in lines:
             if l!="":
                 splitLine = l.split("\t")
-                #print(splitLine)
                 code[splitLine[1]] = splitLine[0]
     return code
 
