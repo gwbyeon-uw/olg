@@ -1,7 +1,7 @@
-"""olg5utr — dual-5'UTR design for eukaryotic overlapping genes (Optimus MRL scorer).
+"""olg5utr — design a 5'UTR shared by two overlapping ORFs to maximize their translation.
 
-The eukaryotic counterpart of ``olgrbs`` (bacterial RBS/OSTIR): given an outer protein and a free 5'
-region, design the shared 5'UTR to maximize translation (mean ribosome load) of BOTH overlapping ORFs,
+Given an outer protein and a free 5' region, design the shared 5'UTR to maximize mean ribosome load
+(MRL) of BOTH overlapping ORFs — scored by Optimus 5-Prime (a CNN trained on a human 5'UTR MPRA) —
 keeping the outer protein fixed up to synonymous codon choice. Uses discrete search (not gradient
 descent).
 

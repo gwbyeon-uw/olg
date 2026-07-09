@@ -374,8 +374,8 @@ class OLGCampaign:
         from olgrbs import optimize_rbs
         olg = self.reconstruct(arr, off, amp_seq, mut_aa, torch.device("cpu"))
         r = optimize_rbs(olg, **dict(scan["rbs_opt"]))
-        base = r.base_expression   # base path depends only on the RNG seed (which this run fixes), not
-                                   # on the search opts, so no separate default-opt run is needed
+        base = r.base_expression   # base path depends only on the RNG seed + anti-SD (asd), neither of
+                                   # which the rbs_opt search params change, so no separate run is needed
         if r.best is None:
             return {"rbs_base": round(base, 1), "rbs_rate": None, "rbs_pctile": None,
                     "rbs_xbase": None, "rbs_n_mut": None, "rbs_method": r.method, "rbs_nt": None}

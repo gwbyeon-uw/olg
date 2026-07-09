@@ -431,7 +431,7 @@ for i in range(n_cycles):
 
 ## RBS design (olgrbs)
 
-`olgrbs` optimizes the **inner** gene's ribosome binding site directly on an `olg` `OLGDesign`. It walks the outer protein's synonymous space (plus the overlap's dual-coding freedom), scores each candidate with [OSTIR](https://github.com/barricklab/ostir) (the Salis 2009 ΔG model), and returns candidates that are **protein-preserving by construction** — the outer CDS translation never changes, and only synonymous inner-CDS changes are made in the overlap. It picks exact enumeration vs. simulated annealing automatically, by the (cheap) count of reachable fold windows.
+`olgrbs` optimizes the **inner** gene's ribosome binding site directly on an `olg` `OLGDesign`. It walks the outer protein's synonymous space (plus the overlap's dual-coding freedom), scores each candidate with [OSTIR](https://github.com/barricklab/ostir) (the Salis 2009 ΔG model), and returns candidates that are **protein-preserving by construction** — the outer CDS translation never changes, and only synonymous inner-CDS changes are made in the overlap. It picks exact enumeration vs. simulated annealing automatically, by the (cheap) count of reachable quartet paths.
 
 ```python
 from olgrbs import optimize_rbs, score_rbs, rbs_window
